@@ -1,0 +1,293 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Get a free hosted Postgres database in seconds: `npx create-db`
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "sqlite"
+}
+
+model CredentialProfile {
+  id                String   @id @default(cuid())
+  label             String   @unique
+  serverUrl         String
+  username          String
+  encryptedPassword String
+  iv                String
+  authTag           String
+  isActive          Boolean  @default(false)
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+}
+
+model Account {
+  id              String            @id @default(cuid())
+  playerName      String
+  tribeId         Int?
+  serverUrl       String
+  language        String?
+  createdAt       DateTime          @default(now())
+  updatedAt       DateTime          @updatedAt
+  villages        Village[]
+  captureRuns     CaptureRun[]
+  accountSnapshots AccountSnapshot[]
+
+  @@unique([serverUrl, playerName])
+}
+
+model Village {
+  id          String            @id @default(cuid())
+  externalId  Int               @unique
+  accountId   String
+  name        String
+  x           Int?
+  y           Int?
+  createdAt   DateTime          @default(now())
+  updatedAt   DateTime          @updatedAt
+  account     Account           @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  snapshots   VillageSnapshot[]
+  captureRuns CaptureRunVillage[]
+  proposals   AgentProposal[]
+}
+
+model CaptureRun {
+  id              String              @id @default(cuid())
+  status          String
+  startedAt       DateTime            @default(now())
+  completedAt     DateTime?
+  errorMessage    String?
+  accountId       String?
+  account         Account?            @relation(fields: [accountId], references: [id], onDelete: SetNull)
+  villageRuns     CaptureRunVillage[]
+  accountSnapshots AccountSnapshot[]
+  villageSnapshots VillageSnapshot[]
+  rawPayloads     RawSnapshotPayload[]
+}
+
+model CaptureRunVillage {
+  id               String    @id @default(cuid())
+  captureRunId     String
+  villageId        String?
+  villageExternalId Int
+  villageName      String?
+  status           String
+  errorMessage     String?
+  hasDorf1         Boolean   @default(false)
+  hasDorf2         Boolean   @default(false)
+  startedAt        DateTime  @default(now())
+  completedAt      DateTime?
+  captureRun       CaptureRun @relation(fields: [captureRunId], references: [id], onDelete: Cascade)
+  village          Village?   @relation(fields: [villageId], references: [id], onDelete: SetNull)
+
+  @@unique([captureRunId, villageExternalId])
+}
+
+model AccountSnapshot {
+  id                      String   @id @default(cuid())
+  captureRunId            String
+  accountId               String
+  gold                    Int?
+  silver                  Int?
+  usedVillageSlots        Int?
+  maxControllableVillages Int?
+  cpProducedForNextSlot   Int?
+  cpNeededForNextSlot     Int?
+  cpProductionTotal       Int?
+  createdAt               DateTime @default(now())
+  captureRun              CaptureRun @relation(fields: [captureRunId], references: [id], onDelete: Cascade)
+  account                 Account    @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  @@unique([captureRunId, accountId])
+}
+
+model VillageSnapshot {
+  id                    String   @id @default(cuid())
+  captureRunId          String
+  villageId             String
+  scrapedAt             DateTime
+  population            Int?
+  loyalty               Int?
+  freeCrop              Int?
+  incomingAttacksAmount Int?
+  hasDorf1              Boolean  @default(false)
+  hasDorf2              Boolean  @default(false)
+  status                String
+  createdAt             DateTime @default(now())
+  captureRun            CaptureRun @relation(fields: [captureRunId], references: [id], onDelete: Cascade)
+  village               Village    @relation(fields: [villageId], references: [id], onDelete: Cascade)
+  resources             ResourceSnapshot[]
+  troops                TroopSnapshot[]
+  resourceFields        ResourceFieldSnapshot[]
+  buildings             BuildingSnapshot[]
+  proposals             AgentProposal[]
+  outcomeEvaluations    AgentOutcome[]
+
+  @@unique([captureRunId, villageId])
+}
+
+model AgentProposal {
+  id                      String   @id @default(cuid())
+  villageId               String
+  villageSnapshotId       String
+  goal                    String
+  status                  String
+  focus                   String
+  headline                String
+  summary                 String
+  confidence              Float
+  selectedCandidateRank   Int?
+  selectedCandidateId     String?
+  decidedAt               DateTime?
+  createdAt               DateTime @default(now())
+  updatedAt               DateTime @updatedAt
+  village                 Village @relation(fields: [villageId], references: [id], onDelete: Cascade)
+  villageSnapshot         VillageSnapshot @relation(fields: [villageSnapshotId], references: [id], onDelete: Cascade)
+  candidates              AgentProposalCandidate[]
+  execution               AgentExecution?
+
+  @@index([villageId, status, createdAt])
+  @@index([villageSnapshotId, createdAt])
+}
+
+model AgentProposalCandidate {
+  id                     String   @id @default(cuid())
+  proposalId             String
+  rank                   Int
+  isRecommended          Boolean  @default(false)
+  label                  String
+  name                   String
+  kind                   String
+  slot                   Int
+  level                  Int?
+  category               String
+  affordableNow          Boolean
+  totalCost              Int
+  timeToAffordHours      Float?
+  heuristicScore         Float
+  learnedScore           Float
+  finalScore             Float
+  confidence             Float
+  featuresJson           String
+  reasonsJson            String
+  createdAt              DateTime @default(now())
+  proposal               AgentProposal @relation(fields: [proposalId], references: [id], onDelete: Cascade)
+  execution              AgentExecution[]
+
+  @@unique([proposalId, rank])
+  @@index([proposalId, isRecommended])
+}
+
+model AgentExecution {
+  id                     String   @id @default(cuid())
+  proposalId             String   @unique
+  candidateId            String
+  status                 String
+  errorMessage           String?
+  executedAt             DateTime?
+  completedAt            DateTime?
+  createdAt              DateTime @default(now())
+  updatedAt              DateTime @updatedAt
+  proposal               AgentProposal @relation(fields: [proposalId], references: [id], onDelete: Cascade)
+  candidate              AgentProposalCandidate @relation(fields: [candidateId], references: [id], onDelete: Cascade)
+  outcome                AgentOutcome?
+
+  @@index([status, createdAt])
+}
+
+model AgentOutcome {
+  id                             String   @id @default(cuid())
+  executionId                    String   @unique
+  villageSnapshotId              String?
+  status                         String
+  reward                         Float?
+  contaminationReason            String?
+  populationDelta                Int?
+  totalProductionDelta           Int?
+  freeCropDelta                  Int?
+  changedTargetsCount            Int?
+  primaryProductionResource      String?
+  primaryProductionDelta         Int?
+  detailsJson                    String?
+  evaluatedAt                    DateTime?
+  createdAt                      DateTime @default(now())
+  updatedAt                      DateTime @updatedAt
+  execution                      AgentExecution @relation(fields: [executionId], references: [id], onDelete: Cascade)
+  villageSnapshot                VillageSnapshot? @relation(fields: [villageSnapshotId], references: [id], onDelete: SetNull)
+
+  @@index([status, createdAt])
+}
+
+model ResourceSnapshot {
+  id                String   @id @default(cuid())
+  villageSnapshotId String
+  type              String
+  amount            Int?
+  productionPerHour Int?
+  capacity          Int?
+  villageSnapshot   VillageSnapshot @relation(fields: [villageSnapshotId], references: [id], onDelete: Cascade)
+}
+
+model TroopSnapshot {
+  id                String   @id @default(cuid())
+  villageSnapshotId String
+  unitCode          String?
+  unitName          String
+  amount            Int?
+  villageSnapshot   VillageSnapshot @relation(fields: [villageSnapshotId], references: [id], onDelete: Cascade)
+}
+
+model ResourceFieldSnapshot {
+  id                  String   @id @default(cuid())
+  villageSnapshotId   String
+  slot                Int
+  gid                 Int
+  type                String
+  name                String
+  level               Int?
+  isMaxLevel          Boolean
+  upgradeStatus       String
+  canAffordUpgrade    Boolean?
+  nextLevelWood       Int?
+  nextLevelClay       Int?
+  nextLevelIron       Int?
+  nextLevelCrop       Int?
+  upgradeDurationText String?
+  villageSnapshot     VillageSnapshot @relation(fields: [villageSnapshotId], references: [id], onDelete: Cascade)
+}
+
+model BuildingSnapshot {
+  id                  String   @id @default(cuid())
+  villageSnapshotId   String
+  slot                Int
+  buildingId          Int?
+  gid                 Int
+  name                String
+  level               Int?
+  isEmpty             Boolean
+  isMaxLevel          Boolean
+  upgradeStatus       String
+  canStartUpgradeNow  Boolean?
+  nextLevelWood       Int?
+  nextLevelClay       Int?
+  nextLevelIron       Int?
+  nextLevelCrop       Int?
+  upgradeDurationText String?
+  href                String?
+  villageSnapshot     VillageSnapshot @relation(fields: [villageSnapshotId], references: [id], onDelete: Cascade)
+}
+
+model RawSnapshotPayload {
+  id              String   @id @default(cuid())
+  captureRunId    String
+  villageExternalId Int?
+  source          String
+  schemaVersion   Int
+  payloadJson     String
+  importedAt      DateTime @default(now())
+  captureRun      CaptureRun @relation(fields: [captureRunId], references: [id], onDelete: Cascade)
+}

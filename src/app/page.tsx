@@ -1,65 +1,85 @@
-import Image from "next/image";
+import { Badge } from "@/components/ui/badge";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { AccountSummary } from "@/components/account-summary";
+import { AlertsRail } from "@/components/alerts-rail";
+import { getCredentialSummary } from "@/lib/credentials";
+import { getDashboardData } from "@/lib/dashboard";
 
-export default function Home() {
+export const dynamic = "force-dynamic";
+
+export default async function Home() {
+  const [dashboard, credentials] = await Promise.all([
+    getDashboardData(),
+    getCredentialSummary(),
+  ]);
+
+  const topVillage = dashboard.villages[0] ?? null;
+  const activeServerUrl =
+    credentials.profiles.find((profile) => profile.id === credentials.activeProfileId)?.serverUrl ??
+    undefined;
+
   return (
-    <div className="flex flex-col flex-1 items-center justify-center bg-zinc-50 font-sans dark:bg-black">
-      <main className="flex flex-1 w-full max-w-3xl flex-col items-center justify-between py-32 px-16 bg-white dark:bg-black sm:items-start">
-        <Image
-          className="dark:invert"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={100}
-          height={20}
-          priority
-        />
-        <div className="flex flex-col items-center gap-6 text-center sm:items-start sm:text-left">
-          <h1 className="max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50">
-            To get started, edit the page.tsx file.
-          </h1>
-          <p className="max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400">
-            Looking for a starting point or more instructions? Head over to{" "}
-            <a
-              href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Templates
-            </a>{" "}
-            or the{" "}
-            <a
-              href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Learning
-            </a>{" "}
-            center.
-          </p>
-        </div>
-        <div className="flex flex-col gap-4 text-base font-medium sm:flex-row">
-          <a
-            className="flex h-12 w-full items-center justify-center gap-2 rounded-full bg-foreground px-5 text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc] md:w-[158px]"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <Image
-              className="dark:invert"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={16}
-              height={16}
-            />
-            Deploy Now
-          </a>
-          <a
-            className="flex h-12 w-full items-center justify-center rounded-full border border-solid border-black/[.08] px-5 transition-colors hover:border-transparent hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a] md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Documentation
-          </a>
-        </div>
-      </main>
-    </div>
+    <main className="flex flex-1 flex-col gap-6">
+      <section className="rounded-[1.75rem] border border-white/12 bg-white/6 p-5 shadow-2xl shadow-black/25 backdrop-blur">
+        <Badge className="w-fit bg-amber-300/15 text-amber-200 hover:bg-amber-300/15">
+          Home
+        </Badge>
+        <h1 className="mt-3 text-3xl font-semibold tracking-tight text-stone-50">
+          Resumen de cuenta
+        </h1>
+      </section>
+
+      <AlertsRail alerts={dashboard.alerts} />
+
+      <AccountSummary
+        account={dashboard.account}
+        activeServerUrl={activeServerUrl}
+        alertsCount={dashboard.alerts.length}
+        compact
+      />
+
+      {topVillage ? (
+        <Card className="border-white/10 bg-black/20">
+          <CardHeader>
+            <p className="text-xs uppercase tracking-[0.18em] text-stone-400">Aldea foco</p>
+            <CardTitle className="mt-2 text-stone-50">{topVillage.name}</CardTitle>
+            <CardDescription className="text-stone-300">
+              {topVillage.coordinates} · {topVillage.population ?? "?"} pop
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            <div className="rounded-2xl border border-amber-300/20 bg-amber-300/10 p-4">
+              <p className="text-xs uppercase tracking-[0.18em] text-amber-200/80">
+                Recomendación actual
+              </p>
+              <p className="mt-2 text-lg font-semibold text-stone-50">
+                {topVillage.topRecommendation}
+              </p>
+              <p className="mt-3 text-sm leading-6 text-stone-300">
+                {topVillage.recommendationSummary}
+              </p>
+            </div>
+            <div className="grid gap-3 sm:grid-cols-3">
+              <div className="rounded-2xl border border-white/8 bg-white/5 p-4">
+                <p className="text-xs uppercase tracking-[0.18em] text-stone-400">Cultivo libre</p>
+                <p className="mt-2 text-lg font-semibold text-stone-50">{topVillage.freeCrop}</p>
+              </div>
+              <div className="rounded-2xl border border-white/8 bg-white/5 p-4">
+                <p className="text-xs uppercase tracking-[0.18em] text-stone-400">Mejoras</p>
+                <p className="mt-2 text-lg font-semibold text-stone-50">
+                  {topVillage.availableUpgrades}
+                </p>
+              </div>
+              <div className="rounded-2xl border border-white/8 bg-white/5 p-4">
+                <p className="text-xs uppercase tracking-[0.18em] text-stone-400">Score</p>
+                <p className="mt-2 text-lg font-semibold text-stone-50">
+                  {topVillage.recommendationScore}
+                </p>
+              </div>
+            </div>
+          </CardContent>
+        </Card>
+      ) : null}
+    </main>
   );
 }
