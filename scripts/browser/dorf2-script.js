@@ -235,6 +235,43 @@ const dorf2Snapshot = (() => {
     };
   };
 
+  const getText = (value) =>
+    (value || "").replace(/\s+/g, " ").trim();
+
+  const parseConstructionQueueItem = (item) => {
+    const nameNode = item.querySelector(".name");
+    const itemText = getText(item.textContent);
+    const nameText = getText(nameNode?.textContent || itemText);
+    const targetLevel =
+      toNumber(
+        nameNode?.querySelector(".lvl")?.textContent ||
+          itemText.match(/Nivel\s+(\d+)/i)?.[1]
+      );
+    const remainingTime = getText(
+      item.querySelector(".timer")?.textContent
+    ) || null;
+    const finishTime =
+      itemText.match(/Listo a las\s+([0-9]{1,2}:[0-9]{2})/i)?.[1] ||
+      null;
+
+    return {
+      slot: null,
+
+      kind: null,
+
+      name: nameText.replace(/\s*Nivel\s+\d+\s*$/i, "") || "Construcción",
+
+      currentLevel:
+        targetLevel !== null ? Math.max(targetLevel - 1, 0) : null,
+
+      targetLevel,
+
+      remainingTime,
+
+      finishTime,
+    };
+  };
+
   /*
    * Busca todos los posibles tooltips dentro de un edificio.
    *
@@ -395,6 +432,8 @@ const dorf2Snapshot = (() => {
 
     if (gid === 0) return "empty";
 
+    if (classes?.contains("underConstruction")) return "underConstruction";
+
     if (classes?.contains("maxLevel")) return "maxLevel";
 
     if (classes?.contains("good")) return "available";
@@ -439,7 +478,8 @@ const dorf2Snapshot = (() => {
       canStartUpgradeNow:
         upgradeStatus === "available"
           ? true
-          : upgradeStatus === "notAvailableNow"
+          : upgradeStatus === "notAvailableNow" ||
+              upgradeStatus === "underConstruction"
             ? false
             : null,
 
@@ -542,6 +582,29 @@ const dorf2Snapshot = (() => {
     }) => building
   );
 
+  const activeConstructions = buildings
+    .filter((building) => building.upgradeStatus === "underConstruction")
+    .map((building) => ({
+      slot: building.slot,
+
+      kind: "building",
+
+      name: building.name,
+
+      currentLevel: building.level,
+
+      targetLevel:
+        building.level !== null ? building.level + 1 : null,
+
+      remainingTime: null,
+
+      finishTime: null,
+    }));
+
+  const constructionQueue = [
+    ...document.querySelectorAll(".buildingList > ul > li"),
+  ].map(parseConstructionQueueItem);
+
   const viewData = getEmbeddedViewData();
 
   const currentVillage = resolveCurrentVillage(viewData?.ownPlayer ?? null);
@@ -588,6 +651,8 @@ const dorf2Snapshot = (() => {
         maxLevelBuildings: buildings.filter(
           (building) => building.isMaxLevel
         ).length,
+
+        activeConstructionSlots: constructionQueue.length,
       },
 
       emptySlots: buildings
@@ -595,6 +660,10 @@ const dorf2Snapshot = (() => {
         .map((building) => building.slot),
 
       buildings,
+
+      buildMenuSlots: [],
+
+      activeConstructions: constructionQueue,
     },
 
     diagnostics: {

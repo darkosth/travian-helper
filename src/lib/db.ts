@@ -51,6 +51,9 @@ const bootstrapStatements = [
     "name" TEXT NOT NULL,
     "x" INTEGER,
     "y" INTEGER,
+    "autoApplyEnabled" BOOLEAN NOT NULL DEFAULT false,
+    "autoApplyPausedAt" DATETIME,
+    "autoApplyPauseReason" TEXT,
     "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "updatedAt" DATETIME NOT NULL,
     FOREIGN KEY ("accountId") REFERENCES "Account"("id") ON DELETE CASCADE ON UPDATE CASCADE
@@ -105,6 +108,8 @@ const bootstrapStatements = [
     "loyalty" INTEGER,
     "freeCrop" INTEGER,
     "incomingAttacksAmount" INTEGER,
+    "activeConstructionSlots" INTEGER,
+    "constructionQueueJson" TEXT,
     "hasDorf1" BOOLEAN NOT NULL DEFAULT false,
     "hasDorf2" BOOLEAN NOT NULL DEFAULT false,
     "status" TEXT NOT NULL,
@@ -141,6 +146,7 @@ const bootstrapStatements = [
     "isMaxLevel" BOOLEAN NOT NULL,
     "upgradeStatus" TEXT NOT NULL,
     "canAffordUpgrade" BOOLEAN,
+    "canStartUpgradeNow" BOOLEAN,
     "nextLevelWood" INTEGER,
     "nextLevelClay" INTEGER,
     "nextLevelIron" INTEGER,
@@ -178,6 +184,27 @@ const bootstrapStatements = [
     "importedAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY ("captureRunId") REFERENCES "CaptureRun"("id") ON DELETE CASCADE ON UPDATE CASCADE
   );`,
+  `CREATE TABLE IF NOT EXISTS "AutoApplyJob" (
+    "id" TEXT NOT NULL PRIMARY KEY,
+    "villageId" TEXT NOT NULL,
+    "status" TEXT NOT NULL,
+    "runAt" DATETIME NOT NULL,
+    "notBefore" DATETIME,
+    "jitterMinutes" INTEGER,
+    "attemptCount" INTEGER NOT NULL DEFAULT 0,
+    "lastError" TEXT,
+    "proposalId" TEXT,
+    "captureRunId" TEXT,
+    "lockToken" TEXT,
+    "lockedAt" DATETIME,
+    "processedAt" DATETIME,
+    "completedAt" DATETIME,
+    "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "updatedAt" DATETIME NOT NULL,
+    FOREIGN KEY ("villageId") REFERENCES "Village"("id") ON DELETE CASCADE ON UPDATE CASCADE
+  );`,
+  `CREATE INDEX IF NOT EXISTS "AutoApplyJob_status_runAt_idx" ON "AutoApplyJob"("status", "runAt");`,
+  `CREATE INDEX IF NOT EXISTS "AutoApplyJob_villageId_status_runAt_idx" ON "AutoApplyJob"("villageId", "status", "runAt");`,
   `CREATE TABLE IF NOT EXISTS "AgentProposal" (
     "id" TEXT NOT NULL PRIMARY KEY,
     "villageId" TEXT NOT NULL,
@@ -289,6 +316,14 @@ const credentialProfileHasIsActiveColumn = async () => {
   return columns.some((column) => column.name === "isActive");
 };
 
+const tableHasColumn = async (tableName: string, columnName: string) => {
+  const columns = await db.$queryRawUnsafe<SqliteTableColumn[]>(
+    `PRAGMA table_info("${tableName}");`,
+  );
+
+  return columns.some((column) => column.name === columnName);
+};
+
 export const ensureDatabase = async () => {
   if (!globalForPrisma.prismaBootstrap) {
     globalForPrisma.prismaBootstrap = (async () => {
@@ -299,6 +334,42 @@ export const ensureDatabase = async () => {
       if (!(await credentialProfileHasIsActiveColumn())) {
         await db.$executeRawUnsafe(
           `ALTER TABLE "CredentialProfile" ADD COLUMN "isActive" BOOLEAN NOT NULL DEFAULT false;`,
+        );
+      }
+
+      if (!(await tableHasColumn("VillageSnapshot", "activeConstructionSlots"))) {
+        await db.$executeRawUnsafe(
+          `ALTER TABLE "VillageSnapshot" ADD COLUMN "activeConstructionSlots" INTEGER;`,
+        );
+      }
+
+      if (!(await tableHasColumn("VillageSnapshot", "constructionQueueJson"))) {
+        await db.$executeRawUnsafe(
+          `ALTER TABLE "VillageSnapshot" ADD COLUMN "constructionQueueJson" TEXT;`,
+        );
+      }
+
+      if (!(await tableHasColumn("Village", "autoApplyEnabled"))) {
+        await db.$executeRawUnsafe(
+          `ALTER TABLE "Village" ADD COLUMN "autoApplyEnabled" BOOLEAN NOT NULL DEFAULT false;`,
+        );
+      }
+
+      if (!(await tableHasColumn("Village", "autoApplyPausedAt"))) {
+        await db.$executeRawUnsafe(
+          `ALTER TABLE "Village" ADD COLUMN "autoApplyPausedAt" DATETIME;`,
+        );
+      }
+
+      if (!(await tableHasColumn("Village", "autoApplyPauseReason"))) {
+        await db.$executeRawUnsafe(
+          `ALTER TABLE "Village" ADD COLUMN "autoApplyPauseReason" TEXT;`,
+        );
+      }
+
+      if (!(await tableHasColumn("ResourceFieldSnapshot", "canStartUpgradeNow"))) {
+        await db.$executeRawUnsafe(
+          `ALTER TABLE "ResourceFieldSnapshot" ADD COLUMN "canStartUpgradeNow" BOOLEAN;`,
         );
       }
 

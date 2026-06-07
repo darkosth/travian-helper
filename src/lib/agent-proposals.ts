@@ -1,6 +1,7 @@
-import "server-only";
 import { db, ensureDatabase } from "@/lib/db";
+import { getActiveScopedAccount } from "@/lib/credentials";
 import { executeApprovedProposal } from "@/lib/playwright-capture";
+import { attachBuildMenuSlotsToSnapshot, parseDorf2BuildMenuPayload } from "@/lib/build-options";
 import {
   buildContextKey,
   buildLearningState,
@@ -9,6 +10,7 @@ import {
   type LearningSignalRecord,
 } from "@/lib/recommendation-learning";
 import {
+  type ActiveConstructionLike,
   buildHeuristicCandidates,
   formatHoursToText,
   type AccountStrategyContext,
@@ -34,6 +36,9 @@ type ProposalCandidateFeatures = {
   contextKey: string;
   category: string;
   kind: RecommendationCandidate["kind"];
+  buildAction: "upgrade" | "construct";
+  targetGid: number | null;
+  targetHref: string | null;
   affordableNow: boolean;
   timeToAffordHours: number | null;
   totalCost: number;
@@ -68,6 +73,8 @@ export type VillageProposalSummary = {
   summary: string;
   confidence: number;
   focus: string;
+  selectedCandidateId: string | null;
+  recommendedCandidateId: string | null;
   createdAt: Date;
   decidedAt: Date | null;
   candidates: ProposalCandidateSummary[];
@@ -82,12 +89,26 @@ const stableJson = (value: unknown) => JSON.stringify(value);
 
 const parseJson = <T>(value: string): T => JSON.parse(value) as T;
 
+const parseConstructionQueue = (value: string | null): ActiveConstructionLike[] => {
+  if (!value) {
+    return [];
+  }
+
+  try {
+    return parseJson<ActiveConstructionLike[]>(value);
+  } catch {
+    return [];
+  }
+};
+
 const getCurrentAccountContext = (accountSnapshot: {
+  tribeId?: number | null;
   usedVillageSlots: number | null;
   maxControllableVillages: number | null;
   cpProducedForNextSlot: number | null;
   cpNeededForNextSlot: number | null;
 } | null): AccountStrategyContext => ({
+  tribeId: accountSnapshot?.tribeId ?? null,
   usedVillageSlots: accountSnapshot?.usedVillageSlots ?? null,
   maxControllableVillages: accountSnapshot?.maxControllableVillages ?? null,
   cpProducedForNextSlot: accountSnapshot?.cpProducedForNextSlot ?? null,
@@ -120,7 +141,11 @@ const getHistoryByVillageId = async (accountId: string) => {
       continue;
     }
 
-    existing.push(snapshot);
+    existing.push({
+      ...snapshot,
+      activeConstructionSlots: snapshot.activeConstructionSlots,
+      constructionQueue: parseConstructionQueue(snapshot.constructionQueueJson),
+    });
     historyByVillageId.set(snapshot.villageId, existing);
   }
 
@@ -155,7 +180,11 @@ const getLearningRecords = async (accountId: string) => {
   const records: LearningSignalRecord[] = [];
 
   for (const proposal of proposals) {
-    const candidate = proposal.candidates[0];
+    const candidate =
+      (proposal.selectedCandidateId
+        ? proposal.candidates.find((entry) => entry.id === proposal.selectedCandidateId)
+        : null) ??
+      proposal.candidates[0];
 
     if (!candidate) {
       continue;
@@ -235,18 +264,31 @@ const serializeCandidate = (candidate: LearningAwareCandidate) => ({
     affordableNow: candidate.affordableNow,
     timeToAffordHours: candidate.timeToAffordHours,
     totalCost: candidate.totalCost,
+    buildAction: candidate.buildAction ?? "upgrade",
+    targetGid: candidate.targetGid ?? null,
+    targetHref: candidate.targetHref ?? null,
   } satisfies ProposalCandidateFeatures),
   reasonsJson: stableJson(candidate.reasons),
 });
 
 const getLatestRunState = async () => {
+  const scopedAccount = await getActiveScopedAccount();
+
+  if (!scopedAccount?.account?.id) {
+    return null;
+  }
+
   const latestRun = await db.captureRun.findFirst({
+    where: {
+      accountId: scopedAccount.account.id,
+    },
     orderBy: {
       startedAt: "desc",
     },
     include: {
       account: true,
       accountSnapshots: true,
+      rawPayloads: true,
       villageSnapshots: {
         include: {
           village: true,
@@ -275,12 +317,34 @@ export const generateAgentProposals = async () => {
     return [];
   }
 
-  const accountContext = getCurrentAccountContext(latestRun.accountSnapshots[0] ?? null);
+  const accountContext = getCurrentAccountContext({
+    ...(latestRun.accountSnapshots[0] ?? {
+      usedVillageSlots: null,
+      maxControllableVillages: null,
+      cpProducedForNextSlot: null,
+      cpNeededForNextSlot: null,
+    }),
+    tribeId: latestRun.account?.tribeId ?? null,
+  });
   const historyByVillageId = await getHistoryByVillageId(latestRun.accountId);
   const learningState = buildLearningState(await getLearningRecords(latestRun.accountId));
   const createdProposalIds: string[] = [];
 
   for (const snapshot of latestRun.villageSnapshots) {
+    const latestDorf2Payload = latestRun.rawPayloads
+      .filter(
+        (payload) =>
+          payload.source === "dorf2" &&
+          payload.villageExternalId === snapshot.village.externalId,
+      )
+      .sort(
+        (left, right) =>
+          new Date(right.importedAt).getTime() - new Date(left.importedAt).getTime(),
+      )[0];
+    const snapshotWithBuildMenus = attachBuildMenuSlotsToSnapshot(
+      snapshot,
+      latestDorf2Payload ? parseDorf2BuildMenuPayload(latestDorf2Payload.payloadJson) : null,
+    );
     const existing = await db.agentProposal.findFirst({
       where: {
         villageSnapshotId: snapshot.id,
@@ -317,14 +381,20 @@ export const generateAgentProposals = async () => {
           freeCrop: snapshot.freeCrop,
           incomingAttacksAmount: snapshot.incomingAttacksAmount,
           population: snapshot.population,
+          activeConstructionSlots: snapshot.activeConstructionSlots,
+          constructionQueue: parseConstructionQueue(snapshot.constructionQueueJson),
           scrapedAt: snapshot.scrapedAt,
           resources: snapshot.resources,
           resourceFields: snapshot.resourceFields,
-          buildings: snapshot.buildings,
+          buildings: snapshotWithBuildMenus.buildings,
         },
       ];
     const heuristic = buildHeuristicCandidates({
-      snapshot,
+      snapshot: {
+        ...snapshotWithBuildMenus,
+        activeConstructionSlots: snapshot.activeConstructionSlots,
+        constructionQueue: parseConstructionQueue(snapshot.constructionQueueJson),
+      },
       history,
       account: accountContext,
     });
@@ -357,8 +427,29 @@ export const generateAgentProposals = async () => {
         ...candidate,
         rank: index,
       }));
+    const strictRouteCandidateId = heuristic.strictRoute?.candidateId ?? null;
+    const strictRouteScore = heuristic.strictRoute?.score ?? null;
+    const strictRouteReasons = heuristic.strictRoute?.reasons ?? [];
+    const prioritizedCandidates = (
+      strictRouteCandidateId
+        ? learningAwareCandidates.map((candidate) =>
+            candidate.id !== strictRouteCandidateId
+              ? candidate
+              : {
+                  ...candidate,
+                  score: Math.max(candidate.score, strictRouteScore ?? candidate.score),
+                  reasons: [...strictRouteReasons, ...candidate.reasons],
+                },
+          )
+        : learningAwareCandidates
+    )
+      .sort((left: LearningAwareCandidate, right: LearningAwareCandidate) => right.score - left.score)
+      .map((candidate: LearningAwareCandidate, index: number) => ({
+        ...candidate,
+        rank: index,
+      }));
 
-    const topCandidate = learningAwareCandidates[0];
+    const topCandidate = prioritizedCandidates[0];
 
     if (!topCandidate) {
       continue;
@@ -384,7 +475,7 @@ export const generateAgentProposals = async () => {
         summary: `${copy.summary} ${copy.confidenceText}.`,
         confidence: topCandidate.confidence,
         candidates: {
-          create: learningAwareCandidates.slice(0, 4).map((candidate: LearningAwareCandidate, index: number) => ({
+          create: prioritizedCandidates.slice(0, 4).map((candidate: LearningAwareCandidate, index: number) => ({
             ...serializeCandidate(candidate),
             rank: index,
             isRecommended: index === 0,
@@ -441,7 +532,7 @@ export const rejectAgentProposal = async (proposalId: string) => {
   });
 };
 
-export const approveAgentProposal = async (proposalId: string) => {
+export const approveAgentProposal = async (proposalId: string, candidateId: string) => {
   await ensureDatabase();
 
   const proposal = await db.agentProposal.findUnique({
@@ -475,10 +566,10 @@ export const approveAgentProposal = async (proposalId: string) => {
     throw new Error("Only pending proposals can be approved.");
   }
 
-  const selected = proposal.candidates[0] ?? null;
+  const selected = proposal.candidates.find((candidate) => candidate.id === candidateId) ?? null;
 
   if (!selected) {
-    throw new Error("Proposal has no candidate.");
+    throw new Error("Selected candidate was not found in this proposal.");
   }
 
   if (!selected.affordableNow) {
@@ -578,6 +669,9 @@ export const listLatestVillageProposals = async (villageIds: string[]) => {
       summary: proposal.summary,
       confidence: proposal.confidence,
       focus: proposal.focus,
+      selectedCandidateId: proposal.selectedCandidateId,
+      recommendedCandidateId:
+        proposal.candidates.find((candidate) => candidate.isRecommended)?.id ?? null,
       createdAt: proposal.createdAt,
       decidedAt: proposal.decidedAt,
       candidates: proposal.candidates.map((candidate) => ({
@@ -633,6 +727,7 @@ const candidateFromRow = (candidate: {
     nextLevelIron: null,
     nextLevelCrop: null,
     timeToAffordHours: candidate.timeToAffordHours,
+    blockedByConstructionQueue: false,
     category: candidate.category as RecommendationCandidate["category"],
     score: candidate.finalScore,
     reasons: parseJson<string[]>(candidate.reasonsJson),

@@ -9,12 +9,23 @@ export async function POST(
   const body = (await request.json().catch(() => null)) as
     | {
         action?: "approve" | "reject";
+        candidateId?: string;
       }
     | null;
 
   try {
     if (body?.action === "approve") {
-      const executionId = await approveAgentProposal(proposalId);
+      if (!body.candidateId) {
+        return NextResponse.json(
+          {
+            ok: false,
+            error: "candidateId is required for approval.",
+          },
+          { status: 400 },
+        );
+      }
+
+      const executionId = await approveAgentProposal(proposalId, body.candidateId);
 
       return NextResponse.json({
         ok: true,

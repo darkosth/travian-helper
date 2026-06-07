@@ -1,11 +1,43 @@
-import "server-only";
-import { listLatestVillageProposals } from "@/lib/agent-proposals";
+import { listVillageAutoApplyState } from "@/lib/auto-apply";
+import { attachBuildMenuSlotsToSnapshot, parseDorf2BuildMenuPayload } from "@/lib/build-options";
+import { getEffectiveConstructionState } from "@/lib/construction-state";
+import { getActiveScopedAccount } from "@/lib/credentials";
 import { db, ensureDatabase } from "@/lib/db";
-import { getVillageRecommendation } from "@/lib/recommendations";
+import {
+  buildVillageDecision,
+  formatHoursToText,
+  type ActiveConstructionLike,
+} from "@/lib/recommendations";
+
+const parseConstructionQueue = (value: string | null): ActiveConstructionLike[] => {
+  if (!value) {
+    return [];
+  }
+
+  try {
+    return JSON.parse(value) as ActiveConstructionLike[];
+  } catch {
+    return [];
+  }
+};
 
 export const getDashboardData = async () => {
   await ensureDatabase();
+  const scopedAccount = await getActiveScopedAccount();
+
+  if (!scopedAccount?.account?.id) {
+    return {
+      latestRun: null,
+      account: null,
+      villages: [],
+      alerts: [],
+    };
+  }
+
   const latestRun = await db.captureRun.findFirst({
+    where: {
+      accountId: scopedAccount.account.id,
+    },
     orderBy: {
       startedAt: "desc",
     },
@@ -17,6 +49,7 @@ export const getDashboardData = async () => {
         },
       },
       accountSnapshots: true,
+      rawPayloads: true,
       villageSnapshots: {
         include: {
           village: true,
@@ -37,7 +70,19 @@ export const getDashboardData = async () => {
   if (!latestRun) {
     return {
       latestRun: null,
-      account: null,
+      account: {
+        playerName: scopedAccount.account.playerName,
+        tribeId: scopedAccount.account.tribeId,
+        serverUrl: scopedAccount.account.serverUrl,
+        language: scopedAccount.account.language,
+        gold: null,
+        silver: null,
+        usedVillageSlots: null,
+        maxControllableVillages: null,
+        cpProducedForNextSlot: null,
+        cpNeededForNextSlot: null,
+        cpProductionTotal: null,
+      },
       villages: [],
       alerts: [],
     };
@@ -50,6 +95,7 @@ export const getDashboardData = async () => {
       freeCrop: number | null;
       incomingAttacksAmount: number | null;
       population: number | null;
+      activeConstructionSlots: number | null;
       scrapedAt: Date;
       resources: typeof latestRun.villageSnapshots[number]["resources"];
       resourceFields: typeof latestRun.villageSnapshots[number]["resourceFields"];
@@ -81,12 +127,36 @@ export const getDashboardData = async () => {
         continue;
       }
 
-      existing.push(historicalSnapshot);
+      existing.push({
+        ...historicalSnapshot,
+        activeConstructionSlots: historicalSnapshot.activeConstructionSlots,
+      });
       historyByVillageId.set(historicalSnapshot.villageId, existing);
     }
   }
 
   const villages = latestRun.villageSnapshots.map((snapshot) => {
+    const latestDorf2Payload = latestRun.rawPayloads
+      ?.filter(
+        (payload) =>
+          payload.source === "dorf2" &&
+          payload.villageExternalId === snapshot.village.externalId,
+      )
+      .sort(
+        (left, right) =>
+          new Date(right.importedAt).getTime() - new Date(left.importedAt).getTime(),
+      )[0];
+    const snapshotWithBuildMenus = attachBuildMenuSlotsToSnapshot(
+      snapshot,
+      latestDorf2Payload ? parseDorf2BuildMenuPayload(latestDorf2Payload.payloadJson) : null,
+    );
+    const effectiveConstruction = getEffectiveConstructionState({
+      activeConstructionSlots: snapshotWithBuildMenus.activeConstructionSlots,
+      constructionQueue: parseConstructionQueue(snapshotWithBuildMenus.constructionQueueJson),
+      scrapedAt: snapshotWithBuildMenus.scrapedAt,
+    });
+    const constructionQueue = effectiveConstruction.constructionQueue;
+    const queueIsFull = effectiveConstruction.activeConstructionSlots >= 2;
     const getResource = (type: "wood" | "clay" | "iron" | "crop") =>
       snapshot.resources.find((resource) => resource.type === type) ?? {
         amount: null,
@@ -100,16 +170,20 @@ export const getDashboardData = async () => {
     );
 
     const availableFieldUpgrades = snapshot.resourceFields.filter(
-      (field) => field.canAffordUpgrade === true,
+      (field) => field.canStartUpgradeNow === true,
     ).length;
 
     const availableBuildingUpgrades = snapshot.buildings.filter(
       (building) => building.canStartUpgradeNow === true,
     ).length;
 
-    const recommendation = getVillageRecommendation({
+    const decision = buildVillageDecision({
       villageName: snapshot.village.name,
-      snapshot,
+      snapshot: {
+        ...snapshotWithBuildMenus,
+        activeConstructionSlots: effectiveConstruction.activeConstructionSlots,
+        constructionQueue,
+      },
       history:
         historyByVillageId.get(snapshot.villageId) ??
         [
@@ -117,19 +191,22 @@ export const getDashboardData = async () => {
             freeCrop: snapshot.freeCrop,
             incomingAttacksAmount: snapshot.incomingAttacksAmount,
             population: snapshot.population,
+            activeConstructionSlots: snapshot.activeConstructionSlots,
             scrapedAt: snapshot.scrapedAt,
             resources: snapshot.resources,
             resourceFields: snapshot.resourceFields,
-            buildings: snapshot.buildings,
+            buildings: snapshotWithBuildMenus.buildings,
           },
         ],
       account: {
+        tribeId: latestRun.account?.tribeId ?? null,
         usedVillageSlots: accountSnapshot?.usedVillageSlots ?? null,
         maxControllableVillages: accountSnapshot?.maxControllableVillages ?? null,
         cpProducedForNextSlot: accountSnapshot?.cpProducedForNextSlot ?? null,
         cpNeededForNextSlot: accountSnapshot?.cpNeededForNextSlot ?? null,
       },
     });
+    const recommendation = decision.recommendation;
 
     return {
       id: snapshot.village.externalId,
@@ -145,7 +222,10 @@ export const getDashboardData = async () => {
       status: snapshot.status,
       scrapedAt: snapshot.scrapedAt,
       visibleTroops,
-      availableUpgrades: availableFieldUpgrades + availableBuildingUpgrades,
+      activeConstructionSlots: effectiveConstruction.activeConstructionSlots,
+      queueExpiredByClock: effectiveConstruction.queueExpiredByClock,
+      constructionQueue,
+      availableUpgrades: queueIsFull ? 0 : availableFieldUpgrades + availableBuildingUpgrades,
       topRecommendation: recommendation.title,
       recommendationSummary: recommendation.summary,
       recommendationPriority: recommendation.priority,
@@ -161,6 +241,16 @@ export const getDashboardData = async () => {
       strictRouteReasons: recommendation.strictRouteReasons,
       snapshotRecommendationTitle: recommendation.snapshotRecommendationTitle,
       snapshotRecommendationSummary: recommendation.snapshotRecommendationSummary,
+      recommendationCandidates: decision.rankedCandidates.slice(0, 3).map((candidate) => ({
+        id: candidate.id,
+        label: candidate.label,
+        category: candidate.category,
+        affordableNow: candidate.affordableNow,
+        blockedByConstructionQueue: candidate.blockedByConstructionQueue,
+        score: candidate.score,
+        reasons: candidate.reasons,
+        waitTimeText: formatHoursToText(candidate.timeToAffordHours),
+      })),
       resources: {
         wood: getResource("wood"),
         clay: getResource("clay"),
@@ -170,16 +260,29 @@ export const getDashboardData = async () => {
     };
   });
 
-  const latestProposals = await listLatestVillageProposals(
+  const autoApplyByVillageId = await listVillageAutoApplyState(
     latestRun.villageSnapshots.map((snapshot) => snapshot.villageId),
   );
 
   const villagesWithProposals = villages.map((village, index) => {
     const snapshot = latestRun.villageSnapshots[index];
+    const autoApplyJob = autoApplyByVillageId.get(snapshot.villageId) ?? null;
 
     return {
       ...village,
-      latestProposal: latestProposals.get(snapshot.villageId) ?? null,
+      dbId: snapshot.villageId,
+      autoApplyEnabled: snapshot.village.autoApplyEnabled,
+      autoApplyPausedAt: snapshot.village.autoApplyPausedAt,
+      autoApplyPauseReason: snapshot.village.autoApplyPauseReason,
+      autoApplyJob: autoApplyJob
+        ? {
+            id: autoApplyJob.id,
+            status: autoApplyJob.status,
+            runAt: autoApplyJob.runAt,
+            lastError: autoApplyJob.lastError,
+            attemptCount: autoApplyJob.attemptCount,
+          }
+        : null,
     };
   });
 

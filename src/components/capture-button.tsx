@@ -35,7 +35,7 @@ export function CaptureButton({ disabled = false }: CaptureButtonProps) {
 
       setMessage(
         result.proposalIds && result.proposalIds.length > 0
-          ? `${result.proposalIds.length} propuesta${result.proposalIds.length === 1 ? "" : "s"} lista${result.proposalIds.length === 1 ? "" : "s"}.`
+          ? `Barrido listo. ${result.proposalIds.length} aldea${result.proposalIds.length === 1 ? "" : "s"} actualizada${result.proposalIds.length === 1 ? "" : "s"}.`
           : "Barrido listo.",
       );
       router.refresh();
@@ -51,7 +51,7 @@ export function CaptureButton({ disabled = false }: CaptureButtonProps) {
         className="min-h-11 min-w-44 bg-amber-300 text-stone-950 hover:bg-amber-200"
       >
         {isPending ? <LoaderCircle className="animate-spin" /> : <Radar />}
-        {isPending ? "Actualizando..." : "Actualizar y proponer"}
+        {isPending ? "Actualizando..." : "Actualizar captura"}
       </Button>
       {message || disabled ? (
         <p className="text-sm text-stone-300">{message ?? "Configura un perfil."}</p>

@@ -1,7 +1,10 @@
-import "server-only";
 import { db, ensureDatabase } from "@/lib/db";
 import { dorf1Schema, dorf2Schema } from "@/lib/travian-schemas";
-import type { Dorf1Snapshot, Dorf2Snapshot } from "@/lib/travian-types";
+import type {
+  ActiveConstructionSnapshot,
+  Dorf1Snapshot,
+  Dorf2Snapshot,
+} from "@/lib/travian-types";
 
 const getIncomingAttacksAmount = (villageRef: Record<string, unknown> | undefined) => {
   if (!villageRef) {
@@ -27,6 +30,76 @@ const getIncomingAttacksAmount = (villageRef: Record<string, unknown> | undefine
   }
 
   return null;
+};
+
+const normalizeText = (value: string) =>
+  value
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+const matchesConstruction = (
+  queueItem: ActiveConstructionSnapshot,
+  activeTarget: ActiveConstructionSnapshot,
+) => {
+  if (normalizeText(queueItem.name) !== normalizeText(activeTarget.name)) {
+    return false;
+  }
+
+  if (
+    queueItem.targetLevel !== null &&
+    activeTarget.currentLevel !== null &&
+    queueItem.targetLevel !== activeTarget.currentLevel + 1
+  ) {
+    return false;
+  }
+
+  return true;
+};
+
+const buildActiveConstructionQueue = (
+  dorf1: Dorf1Snapshot,
+  dorf2: Dorf2Snapshot,
+): ActiveConstructionSnapshot[] => {
+  const queueItems = dorf2.villageCenter.activeConstructions;
+  const activeTargets = [
+    ...dorf1.village.activeConstructions,
+    ...dorf2.villageCenter.buildings
+      .filter((building) => building.upgradeStatus === "underConstruction")
+      .map(
+        (building): ActiveConstructionSnapshot => ({
+          slot: building.slot,
+          kind: "building",
+          name: building.name,
+          currentLevel: building.level,
+          targetLevel: building.level !== null ? building.level + 1 : null,
+          remainingTime: null,
+          finishTime: null,
+        }),
+      ),
+  ];
+  const unmatchedTargets = [...activeTargets];
+
+  return queueItems.map((queueItem) => {
+    const matchedIndex = unmatchedTargets.findIndex((target) =>
+      matchesConstruction(queueItem, target),
+    );
+
+    if (matchedIndex === -1) {
+      return queueItem;
+    }
+
+    const matchedTarget = unmatchedTargets.splice(matchedIndex, 1)[0];
+
+    return {
+      ...queueItem,
+      slot: matchedTarget.slot,
+      kind: matchedTarget.kind,
+      currentLevel: matchedTarget.currentLevel,
+    };
+  });
 };
 
 const ensureAccount = async (snapshot: Dorf1Snapshot) => {
@@ -166,6 +239,7 @@ const replaceVillageSnapshotChildren = async (villageSnapshotId: string, dorf1: 
         isMaxLevel: field.isMaxLevel,
         upgradeStatus: field.upgradeStatus,
         canAffordUpgrade: field.canAffordUpgrade,
+        canStartUpgradeNow: field.canStartUpgradeNow,
         nextLevelWood: field.nextLevelCosts?.wood ?? null,
         nextLevelClay: field.nextLevelCosts?.clay ?? null,
         nextLevelIron: field.nextLevelCosts?.iron ?? null,
@@ -278,6 +352,7 @@ export const importVillageCapture = async (input: {
   const scrapedAt = new Date(
     [dorf1.scrapedAt, dorf2.scrapedAt].sort().slice(-1)[0] ?? dorf1.scrapedAt,
   );
+  const activeConstructionQueue = buildActiveConstructionQueue(dorf1, dorf2);
 
   const villageSnapshot = await db.villageSnapshot.upsert({
     where: {
@@ -292,6 +367,8 @@ export const importVillageCapture = async (input: {
       loyalty: dorf1.village.current.loyalty,
       freeCrop: dorf1.village.resources.freeCrop,
       incomingAttacksAmount: getIncomingAttacksAmount(currentVillageReference),
+      activeConstructionSlots: activeConstructionQueue.length,
+      constructionQueueJson: JSON.stringify(activeConstructionQueue),
       hasDorf1: true,
       hasDorf2: true,
       status: "complete",
@@ -304,6 +381,8 @@ export const importVillageCapture = async (input: {
       loyalty: dorf1.village.current.loyalty,
       freeCrop: dorf1.village.resources.freeCrop,
       incomingAttacksAmount: getIncomingAttacksAmount(currentVillageReference),
+      activeConstructionSlots: activeConstructionQueue.length,
+      constructionQueueJson: JSON.stringify(activeConstructionQueue),
       hasDorf1: true,
       hasDorf2: true,
       status: "complete",

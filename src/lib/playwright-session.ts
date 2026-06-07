@@ -1,7 +1,6 @@
 import { access, mkdir, rm } from "node:fs/promises";
 import { join } from "node:path";
 import type { BrowserContext } from "playwright";
-import "server-only";
 
 const sessionStatePath = join(process.cwd(), ".cache", "playwright", "travian-storage-state.json");
 

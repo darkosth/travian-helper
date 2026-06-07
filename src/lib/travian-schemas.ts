@@ -18,6 +18,32 @@ const villageRefSchema = z.object({
   y: numberOrNull,
 });
 
+const activeConstructionSchema = z.object({
+  slot: numberOrNull,
+  kind: z.enum(["resourceField", "building"]).nullable(),
+  name: z.string(),
+  currentLevel: numberOrNull,
+  targetLevel: numberOrNull,
+  remainingTime: z.string().nullable(),
+  finishTime: z.string().nullable(),
+});
+
+const buildMenuOptionSchema = z.object({
+  gid: z.number(),
+  name: z.string(),
+  category: numberOrNull,
+  availableNow: z.boolean(),
+  blockedReason: z.string().nullable(),
+  nextLevelCosts: z.object({
+    wood: numberOrNull,
+    clay: numberOrNull,
+    iron: numberOrNull,
+    crop: numberOrNull,
+  }),
+  duration: z.string().nullable(),
+  actionHref: z.string().nullable(),
+});
+
 export const dorf1Schema = z.object({
   schemaVersion: z.literal(1),
   source: z.literal("dorf1"),
@@ -104,10 +130,12 @@ export const dorf1Schema = z.object({
         isMaxLevel: z.boolean(),
         upgradeStatus: z.string(),
         canAffordUpgrade: z.boolean().nullable(),
+        canStartUpgradeNow: z.boolean().nullable(),
         nextLevelCosts: nextLevelCostsSchema,
         upgradeDuration: z.string().nullable(),
       }),
     ),
+    activeConstructions: z.array(activeConstructionSchema),
   }),
   diagnostics: z.object({
     resourceFieldCount: z.number(),
@@ -135,6 +163,7 @@ export const dorf2Schema = z.object({
       emptySlots: z.number(),
       upgradesAvailableNow: z.number(),
       maxLevelBuildings: z.number(),
+      activeConstructionSlots: z.number(),
     }),
     emptySlots: z.array(z.number()),
     buildings: z.array(
@@ -153,6 +182,15 @@ export const dorf2Schema = z.object({
         href: z.string().nullable(),
       }),
     ),
+    buildMenuSlots: z.array(
+      z.object({
+        slot: numberOrNull,
+        category: numberOrNull,
+        activeTab: z.string().nullable(),
+        options: z.array(buildMenuOptionSchema),
+      }),
+    ),
+    activeConstructions: z.array(activeConstructionSchema),
   }),
   diagnostics: z.object({
     buildingCount: z.number(),

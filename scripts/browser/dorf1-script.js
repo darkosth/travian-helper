@@ -339,6 +339,8 @@ const dorf1Snapshot = (() => {
   const getFieldUpgradeStatus = (field) => {
     const classes = field.classList;
 
+    if (classes.contains("underConstruction")) return "underConstruction";
+
     if (classes.contains("maxLevel")) return "maxLevel";
 
     if (classes.contains("good")) return "available";
@@ -470,9 +472,17 @@ const dorf1Snapshot = (() => {
       upgradeStatus,
 
       canAffordUpgrade:
-        upgradeStatus === "maxLevel"
+        upgradeStatus === "maxLevel" || upgradeStatus === "underConstruction"
           ? null
           : canAffordUpgrade(upgradeData.nextLevelCosts),
+
+      canStartUpgradeNow:
+        upgradeStatus === "available"
+          ? true
+          : upgradeStatus === "notAvailableNow" ||
+              upgradeStatus === "underConstruction"
+            ? false
+            : null,
 
       nextLevelCosts:
         upgradeStatus === "maxLevel"
@@ -485,6 +495,25 @@ const dorf1Snapshot = (() => {
           : upgradeData.upgradeDuration,
     };
   });
+
+  const activeConstructions = resourceFields
+    .filter((field) => field.upgradeStatus === "underConstruction")
+    .map((field) => ({
+      slot: field.slot,
+
+      kind: "resourceField",
+
+      name: field.name,
+
+      currentLevel: field.level,
+
+      targetLevel:
+        field.level !== null ? field.level + 1 : null,
+
+      remainingTime: null,
+
+      finishTime: null,
+    }));
 
   /*
    * Extrae las tropas visibles en la tabla de la aldea.
@@ -577,6 +606,8 @@ const dorf1Snapshot = (() => {
       troops,
 
       resourceFields,
+
+      activeConstructions,
     },
 
     diagnostics: {

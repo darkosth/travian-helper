@@ -1,4 +1,3 @@
-import "server-only";
 import { db, ensureDatabase } from "@/lib/db";
 import { decryptSecret, encryptSecret } from "@/lib/crypto";
 import { clearSavedSessionState } from "@/lib/playwright-session";
@@ -90,6 +89,48 @@ export const getCredentialSummary = async () => {
   return {
     profiles,
     activeProfileId: activeProfile?.id ?? null,
+  };
+};
+
+export const getActiveScopedAccount = async () => {
+  await ensureDatabase();
+
+  const profile = await getActiveCredentialProfile();
+
+  if (!profile) {
+    return null;
+  }
+
+  const latestRunForProfile = await db.captureRun.findFirst({
+    where: {
+      account: {
+        serverUrl: profile.serverUrl,
+      },
+      accountId: {
+        not: null,
+      },
+      status: "complete",
+    },
+    orderBy: {
+      startedAt: "desc",
+    },
+    include: {
+      account: true,
+    },
+  });
+
+  if (!latestRunForProfile?.account) {
+    return {
+      profile,
+      account: null,
+      latestRunId: null,
+    };
+  }
+
+  return {
+    profile,
+    account: latestRunForProfile.account,
+    latestRunId: latestRunForProfile.id,
   };
 };
 

@@ -1,5 +1,12 @@
-import "server-only";
 import { secondVillageRoute, type StrictRouteMilestone } from "@/lib/second-village-route";
+import {
+  findBuildingDefinitions,
+  type TravianBuildingDefinition,
+} from "@/lib/travian-buildings";
+import {
+  getSoonestQueueWaitHours,
+  withEffectiveConstructionState,
+} from "@/lib/construction-state";
 
 export type ResourceType = "wood" | "clay" | "iron" | "crop";
 
@@ -12,10 +19,13 @@ export type ResourceSnapshotLike = {
 
 export type ResourceFieldSnapshotLike = {
   slot: number;
+  gid?: number;
   type: string;
   name: string;
   level: number | null;
+  upgradeStatus?: string;
   canAffordUpgrade: boolean | null;
+  canStartUpgradeNow: boolean | null;
   nextLevelWood: number | null;
   nextLevelClay: number | null;
   nextLevelIron: number | null;
@@ -24,20 +34,50 @@ export type ResourceFieldSnapshotLike = {
 
 export type BuildingSnapshotLike = {
   slot: number;
+  gid?: number;
   name: string;
   level: number | null;
   isEmpty?: boolean;
+  upgradeStatus?: string;
   canStartUpgradeNow: boolean | null;
   nextLevelWood: number | null;
   nextLevelClay: number | null;
   nextLevelIron: number | null;
   nextLevelCrop: number | null;
+  href?: string | null;
+  constructOptions?: Array<{
+    gid: number;
+    name: string;
+    category: number | null;
+    availableNow: boolean;
+    blockedReason: string | null;
+    nextLevelCosts: {
+      wood: number | null;
+      clay: number | null;
+      iron: number | null;
+      crop: number | null;
+    };
+    duration: string | null;
+    actionHref: string | null;
+  }>;
+};
+
+export type ActiveConstructionLike = {
+  slot: number | null;
+  kind: "resourceField" | "building" | null;
+  name: string;
+  currentLevel: number | null;
+  targetLevel: number | null;
+  remainingTime: string | null;
+  finishTime: string | null;
 };
 
 export type VillageSnapshotLike = {
   freeCrop: number | null;
   incomingAttacksAmount: number | null;
   population: number | null;
+  activeConstructionSlots?: number | null;
+  constructionQueue?: ActiveConstructionLike[];
   scrapedAt?: Date | string;
   resources: ResourceSnapshotLike[];
   resourceFields: ResourceFieldSnapshotLike[];
@@ -45,6 +85,7 @@ export type VillageSnapshotLike = {
 };
 
 export type AccountStrategyContext = {
+  tribeId?: number | null;
   usedVillageSlots: number | null;
   maxControllableVillages: number | null;
   cpProducedForNextSlot: number | null;
@@ -80,9 +121,13 @@ export type RecommendationCandidate = {
   nextLevelIron: number | null;
   nextLevelCrop: number | null;
   timeToAffordHours: number | null;
+  blockedByConstructionQueue: boolean;
   category: CandidateCategory;
   score: number;
   reasons: string[];
+  buildAction?: "upgrade" | "construct";
+  targetGid?: number | null;
+  targetHref?: string | null;
 };
 
 type MemorySignal = {
@@ -111,6 +156,13 @@ export type VillageRecommendation = {
   strictRouteReasons: string[];
   snapshotRecommendationTitle: string;
   snapshotRecommendationSummary: string;
+};
+
+export type VillageDecision = {
+  recommendation: VillageRecommendation;
+  rankedCandidates: RecommendationCandidate[];
+  memory: MemoryProfile;
+  focus: string;
 };
 
 const resourceTypes: ResourceType[] = ["wood", "clay", "iron", "crop"];
@@ -167,6 +219,8 @@ const getLowestProductionType = (resources: Record<ResourceType, ResourceSnapsho
 
 const formatUpgradeLabel = (name: string, slot: number, level: number | null) =>
   `${name} (slot ${slot}${level !== null ? `, lvl ${level}` : ""})`;
+
+const formatConstructionLabel = (name: string, slot: number) => `Build ${name} (slot ${slot})`;
 
 export const formatHoursToText = (value: number | null) => {
   if (value === null || !Number.isFinite(value) || value <= 0) {
@@ -252,6 +306,28 @@ const getMissingResources = (
   iron: Math.max(0, (candidate.nextLevelIron ?? 0) - (resources.iron.amount ?? 0)),
   crop: Math.max(0, (candidate.nextLevelCrop ?? 0) - (resources.crop.amount ?? 0)),
 });
+
+const combineWaitHours = (input: {
+  baseWaitHours: number | null;
+  queueWaitHours: number | null;
+  queueIsFull: boolean;
+}) => {
+  const { baseWaitHours, queueWaitHours, queueIsFull } = input;
+
+  if (!queueIsFull) {
+    return baseWaitHours;
+  }
+
+  if (baseWaitHours === null) {
+    return null;
+  }
+
+  if (queueWaitHours === null) {
+    return baseWaitHours;
+  }
+
+  return Math.max(baseWaitHours, queueWaitHours);
+};
 
 export const getCategoryLabel = (category: CandidateCategory) => {
   switch (category) {
@@ -394,6 +470,100 @@ export const getCategoryFromCandidate = (candidate: ResourceFieldSnapshotLike | 
 const getSlotLevelMap = (items: Array<{ slot: number; level: number | null }>) =>
   new Map(items.map((item) => [item.slot, item.level ?? 0]));
 
+const getEmptyBuildingSlot = (
+  snapshot: VillageSnapshotLike,
+  definition: TravianBuildingDefinition,
+) => {
+  const allowedSlots =
+    definition.slotKind === "rallyPoint"
+      ? [39]
+      : definition.slotKind === "wall"
+        ? [40]
+        : Array.from({ length: 20 }, (_, index) => index + 19).filter((slot) => slot !== 39 && slot !== 40);
+
+  return (
+    snapshot.buildings
+      .filter((building) => building.isEmpty)
+      .find((building) => allowedSlots.includes(building.slot)) ?? null
+  );
+};
+
+const getConstructionCandidate = (input: {
+  snapshot: VillageSnapshotLike;
+  resources: Record<ResourceType, ResourceSnapshotLike>;
+  queueIsFull: boolean;
+  queueWaitHours: number | null;
+  definition: TravianBuildingDefinition;
+}) => {
+  const { snapshot, resources, queueIsFull, queueWaitHours, definition } = input;
+  const existingBuilding = snapshot.buildings.find(
+    (building) => !building.isEmpty && building.gid === definition.gid,
+  );
+
+  if (existingBuilding) {
+    return null;
+  }
+
+  const emptySlot = getEmptyBuildingSlot(snapshot, definition);
+
+  if (!emptySlot) {
+    return null;
+  }
+
+  const liveOption =
+    emptySlot.constructOptions?.find((option) => option.gid === definition.gid) ?? null;
+  const costs = {
+    nextLevelWood: liveOption?.nextLevelCosts.wood ?? definition.level1Costs.wood,
+    nextLevelClay: liveOption?.nextLevelCosts.clay ?? definition.level1Costs.clay,
+    nextLevelIron: liveOption?.nextLevelCosts.iron ?? definition.level1Costs.iron,
+    nextLevelCrop: liveOption?.nextLevelCosts.crop ?? definition.level1Costs.crop,
+  };
+  const baseWaitHours = getTimeToAffordHours(costs, resources);
+  const canAffordNow = resourceTypes.every((type) => {
+    const amount = resources[type].amount ?? 0;
+    const required =
+      type === "wood"
+        ? costs.nextLevelWood
+        : type === "clay"
+          ? costs.nextLevelClay
+          : type === "iron"
+            ? costs.nextLevelIron
+            : costs.nextLevelCrop;
+
+    return amount >= required;
+  });
+
+  return {
+    id: `construct-${emptySlot.slot}-${definition.gid}`,
+    slot: emptySlot.slot,
+    level: 0,
+    label: formatConstructionLabel(liveOption?.name ?? definition.defaultName, emptySlot.slot),
+    name: liveOption?.name ?? definition.defaultName,
+    kind: "building" as const,
+    affordableNow: !queueIsFull && (liveOption ? liveOption.availableNow : canAffordNow),
+    totalCost: getTotalCost(costs),
+    nextLevelWood: costs.nextLevelWood,
+    nextLevelClay: costs.nextLevelClay,
+    nextLevelIron: costs.nextLevelIron,
+    nextLevelCrop: costs.nextLevelCrop,
+    timeToAffordHours:
+      !queueIsFull && canAffordNow
+        ? 0
+        : combineWaitHours({
+            baseWaitHours,
+            queueWaitHours,
+            queueIsFull,
+          }),
+    blockedByConstructionQueue: queueIsFull,
+    category: classifyBuildingCategory(liveOption?.name ?? definition.defaultName),
+    score: 0,
+    reasons: liveOption?.blockedReason ? [liveOption.blockedReason] : ([] as string[]),
+    buildAction: "construct" as const,
+    targetGid: definition.gid,
+    targetHref: liveOption?.actionHref ?? emptySlot.href ?? null,
+  };
+};
+
 export const buildMemoryProfile = (history: VillageSnapshotLike[]): MemoryProfile => {
   if (history.length < 2) {
     return {
@@ -474,48 +644,92 @@ export const buildMemoryProfile = (history: VillageSnapshotLike[]): MemoryProfil
 };
 
 export const buildCandidateList = (snapshot: VillageSnapshotLike, resources: Record<ResourceType, ResourceSnapshotLike>) => {
-  const fieldCandidates = snapshot.resourceFields
-    .filter((field) => getTotalCost(field) > 0)
-    .map((field) => ({
+  const effectiveSnapshot = withEffectiveConstructionState(snapshot);
+  const queueIsFull = (effectiveSnapshot.activeConstructionSlots ?? 0) >= 2;
+  const queueWaitHours = getSoonestQueueWaitHours(effectiveSnapshot);
+  const fieldCandidates = effectiveSnapshot.resourceFields
+    .filter(
+      (field) =>
+        field.upgradeStatus !== "underConstruction" &&
+        getTotalCost(field) > 0,
+    )
+    .map((field) => {
+      const baseWaitHours =
+        field.canAffordUpgrade === true ? 0 : getTimeToAffordHours(field, resources);
+
+      return {
       id: `field-${field.slot}`,
       slot: field.slot,
       level: field.level,
       label: formatUpgradeLabel(field.name, field.slot, field.level),
       name: field.name,
       kind: "resourceField" as const,
-      affordableNow: field.canAffordUpgrade === true,
+      affordableNow:
+        field.canStartUpgradeNow === true && !queueIsFull,
       totalCost: getTotalCost(field),
       nextLevelWood: field.nextLevelWood,
       nextLevelClay: field.nextLevelClay,
       nextLevelIron: field.nextLevelIron,
       nextLevelCrop: field.nextLevelCrop,
-      timeToAffordHours: field.canAffordUpgrade === true ? 0 : getTimeToAffordHours(field, resources),
+      timeToAffordHours:
+        field.canStartUpgradeNow === true && !queueIsFull
+          ? 0
+          : combineWaitHours({
+              baseWaitHours,
+              queueWaitHours,
+              queueIsFull,
+            }),
+      blockedByConstructionQueue: queueIsFull,
       category: getCategoryFromCandidate(field),
       score: 0,
       reasons: [] as string[],
-    }));
+      buildAction: "upgrade" as const,
+      targetGid: field.gid,
+      targetHref: null,
+      };
+    });
 
-  const buildingCandidates = snapshot.buildings
-    .filter((building) => !building.isEmpty && getTotalCost(building) > 0)
-    .map((building) => ({
+  const buildingCandidates = effectiveSnapshot.buildings
+    .filter(
+      (building) =>
+        !building.isEmpty &&
+        building.upgradeStatus !== "underConstruction" &&
+        getTotalCost(building) > 0,
+    )
+    .map((building) => {
+      const baseWaitHours = getTimeToAffordHours(building, resources);
+
+      return {
       id: `building-${building.slot}`,
       slot: building.slot,
       level: building.level,
       label: formatUpgradeLabel(building.name, building.slot, building.level),
       name: building.name,
       kind: "building" as const,
-      affordableNow: building.canStartUpgradeNow === true,
+      affordableNow:
+        building.canStartUpgradeNow === true && !queueIsFull,
       totalCost: getTotalCost(building),
       nextLevelWood: building.nextLevelWood,
       nextLevelClay: building.nextLevelClay,
       nextLevelIron: building.nextLevelIron,
       nextLevelCrop: building.nextLevelCrop,
       timeToAffordHours:
-        building.canStartUpgradeNow === true ? 0 : getTimeToAffordHours(building, resources),
+        building.canStartUpgradeNow === true && !queueIsFull
+          ? 0
+          : combineWaitHours({
+              baseWaitHours,
+              queueWaitHours,
+              queueIsFull,
+            }),
+      blockedByConstructionQueue: queueIsFull,
       category: getCategoryFromCandidate(building),
       score: 0,
       reasons: [] as string[],
-    }));
+      buildAction: "upgrade" as const,
+      targetGid: building.gid ?? null,
+      targetHref: building.href ?? null,
+      };
+    });
 
   return [...fieldCandidates, ...buildingCandidates];
 };
@@ -546,6 +760,9 @@ export const scoreCandidate = (input: {
   if (candidate.affordableNow) {
     score += 18;
     reasons.push("+18 affordable now");
+  } else if (candidate.blockedByConstructionQueue) {
+    score -= 8;
+    reasons.push("-8 both construction slots are busy right now");
   } else if (candidate.timeToAffordHours !== null) {
     if (candidate.timeToAffordHours <= 0.5) {
       score += 12;
@@ -697,11 +914,13 @@ export const buildHeuristicCandidates = (input: {
   resources: Record<ResourceType, ResourceSnapshotLike>;
   memory: MemoryProfile;
   candidates: RecommendationCandidate[];
+  strictRoute: StrictRouteContext | null;
 } => {
-  const { snapshot, history, account } = input;
+  const { history, account } = input;
+  const snapshot = withEffectiveConstructionState(input.snapshot);
   const resources = getResourceBuckets(snapshot.resources);
   const memory = buildMemoryProfile(history);
-  const candidates = buildCandidateList(snapshot, resources).map((candidate) =>
+  const scoredCandidates = buildCandidateList(snapshot, resources).map((candidate) =>
     scoreCandidate({
       candidate,
       snapshot,
@@ -710,11 +929,26 @@ export const buildHeuristicCandidates = (input: {
       memory,
     }),
   );
+  const strictRoute =
+    (account.usedVillageSlots ?? 1) < 2
+      ? getStrictRouteRecommendation({
+          snapshot,
+          account,
+          candidates: scoredCandidates,
+          resources,
+          memory,
+        })
+      : null;
+  const candidates =
+    strictRoute?.candidate && !scoredCandidates.some((candidate) => candidate.id === strictRoute.candidateId)
+      ? [...scoredCandidates, strictRoute.candidate]
+      : scoredCandidates;
 
   return {
     resources,
     memory,
     candidates,
+    strictRoute,
   };
 };
 
@@ -775,7 +1009,10 @@ const isMilestoneComplete = (
 
 const findMilestoneCandidate = (
   milestone: StrictRouteMilestone,
+  snapshot: VillageSnapshotLike,
+  account: AccountStrategyContext,
   candidates: RecommendationCandidate[],
+  resources: Record<ResourceType, ResourceSnapshotLike>,
 ) => {
   switch (milestone.target.kind) {
     case "field": {
@@ -796,21 +1033,62 @@ const findMilestoneCandidate = (
         )[0];
     }
     case "building": {
-      const target = milestone.target;
+      const resolveBuildingTarget = (
+        targetNames: string[],
+        targetLevel: number,
+        visitedGids = new Set<number>(),
+      ): RecommendationCandidate | undefined => {
+        const upgradeCandidate = candidates
+          .filter(
+            (candidate) =>
+              candidate.kind === "building" &&
+              matchesAnyName(candidate.name, targetNames) &&
+              (candidate.level ?? 0) < targetLevel,
+          )
+          .sort(
+            (left, right) =>
+              (left.level ?? 0) - (right.level ?? 0) ||
+              left.totalCost - right.totalCost ||
+              left.slot - right.slot,
+          )[0];
 
-      return candidates
-        .filter(
-          (candidate) =>
-            candidate.kind === "building" &&
-            matchesAnyName(candidate.name, target.names) &&
-            (candidate.level ?? 0) < target.targetLevel,
-        )
-        .sort(
-          (left, right) =>
-            (left.level ?? 0) - (right.level ?? 0) ||
-            left.totalCost - right.totalCost ||
-            left.slot - right.slot,
-        )[0];
+        if (upgradeCandidate) {
+          return upgradeCandidate;
+        }
+
+        const definition = findBuildingDefinitions(targetNames, account.tribeId)[0];
+
+        if (!definition || visitedGids.has(definition.gid)) {
+          return undefined;
+        }
+
+        const nextVisited = new Set(visitedGids);
+        nextVisited.add(definition.gid);
+
+        for (const prerequisite of definition.prerequisites) {
+          if (getBuildingLevel(snapshot, prerequisite.names) >= prerequisite.minimumLevel) {
+            continue;
+          }
+
+          return resolveBuildingTarget(
+            prerequisite.names,
+            prerequisite.minimumLevel,
+            nextVisited,
+          );
+        }
+
+        return (
+          getConstructionCandidate({
+            snapshot,
+            resources,
+            queueIsFull: (snapshot.activeConstructionSlots ?? 0) >= 2,
+            queueWaitHours: getSoonestQueueWaitHours(snapshot),
+            definition,
+          }) ?? undefined
+        );
+      };
+
+      return resolveBuildingTarget(milestone.target.names, milestone.target.targetLevel);
     }
     default:
       return undefined;
@@ -849,13 +1127,25 @@ const getExpansionMilestoneOverride = (
   return null;
 };
 
+type StrictRouteContext = {
+  candidateId: string | null;
+  candidate: RecommendationCandidate | null;
+  title: string;
+  summary: string;
+  waitTimeText: string | null;
+  shouldWait: boolean;
+  reasons: string[];
+  score: number;
+};
+
 const getStrictRouteRecommendation = (input: {
   snapshot: VillageSnapshotLike;
   account: AccountStrategyContext;
   candidates: RecommendationCandidate[];
   resources: Record<ResourceType, ResourceSnapshotLike>;
-}) => {
-  const { snapshot, account, candidates, resources } = input;
+  memory: MemoryProfile;
+}): StrictRouteContext | null => {
+  const { snapshot, account, candidates, resources, memory } = input;
   const override = getExpansionMilestoneOverride(snapshot, account);
   const milestone =
     override ??
@@ -865,10 +1155,18 @@ const getStrictRouteRecommendation = (input: {
     return null;
   }
 
-  const milestoneCandidate = findMilestoneCandidate(milestone, candidates);
+  const milestoneCandidate = findMilestoneCandidate(
+    milestone,
+    snapshot,
+    account,
+    candidates,
+    resources,
+  );
 
   if (!milestoneCandidate) {
     return {
+      candidateId: null,
+      candidate: null,
       title: milestone.title,
       summary: `${milestone.summary} Cost and ETA are unavailable until this exact build option appears in the captured village state.`,
       waitTimeText: null,
@@ -878,25 +1176,71 @@ const getStrictRouteRecommendation = (input: {
     };
   }
 
-  const missing = getMissingResources(milestoneCandidate, resources);
+  const resolvedCandidate =
+    milestoneCandidate.score === 0 && milestoneCandidate.reasons.length === 0
+      ? scoreCandidate({
+          candidate: milestoneCandidate,
+          snapshot,
+          account,
+          resources,
+          memory,
+        })
+      : milestoneCandidate;
+  const missing = getMissingResources(resolvedCandidate, resources);
   const missingText = formatResourceList(missing);
-  const waitTimeText = formatHoursToText(milestoneCandidate.timeToAffordHours);
-  const action = milestoneCandidate.affordableNow
-    ? `${milestoneCandidate.label} is available now.`
-    : `Wait ${waitTimeText ?? "until production catches up"} for ${milestoneCandidate.label}.`;
+  const waitTimeText = formatHoursToText(resolvedCandidate.timeToAffordHours);
+  const isPrerequisiteStep =
+    !matchesAnyName(
+      resolvedCandidate.name,
+      milestone.target.kind === "building" ? milestone.target.names : [],
+    );
+  const action = resolvedCandidate.affordableNow
+    ? `${resolvedCandidate.label} is available now.`
+    : `Wait ${waitTimeText ?? "until production catches up"} for ${resolvedCandidate.label}.`;
+  const prerequisiteText =
+    isPrerequisiteStep && milestone.target.kind === "building"
+      ? ` Route repair: ${milestoneCandidate.name} is missing before ${milestone.title}.`
+      : "";
   const costText = missingText ? ` Missing: ${missingText}.` : "";
 
   return {
-    title: milestoneCandidate.affordableNow ? milestoneCandidate.label : `Wait for ${milestoneCandidate.label}`,
-    summary: `${milestone.summary} ${action}${costText}`,
+    candidateId: resolvedCandidate.id,
+    candidate: resolvedCandidate,
+    title: resolvedCandidate.affordableNow ? resolvedCandidate.label : `Wait for ${resolvedCandidate.label}`,
+    summary: `${milestone.summary}${prerequisiteText} ${action}${costText}`,
     waitTimeText,
-    shouldWait: !milestoneCandidate.affordableNow,
+    shouldWait: !resolvedCandidate.affordableNow,
     reasons: [
       ...milestone.reasons,
-      ...(milestoneCandidate.affordableNow ? ["Strict route step is affordable now"] : ["Strict route step is not affordable yet"]),
+      ...(resolvedCandidate.affordableNow
+        ? ["Strict route step is affordable now"]
+        : ["Strict route step is not affordable yet"]),
     ],
-    score: Math.max(95, milestoneCandidate.score),
+    score: Math.max(95, resolvedCandidate.score),
   };
+};
+
+const applyStrictRoutePriority = (
+  candidates: RecommendationCandidate[],
+  strictRoute: StrictRouteContext | null,
+) => {
+  if (!strictRoute?.candidateId) {
+    return candidates.slice().sort((left, right) => right.score - left.score);
+  }
+
+  return candidates
+    .map((candidate) => {
+      if (candidate.id !== strictRoute.candidateId) {
+        return candidate;
+      }
+
+      return {
+        ...candidate,
+        score: Math.max(candidate.score, strictRoute.score),
+        reasons: [...strictRoute.reasons, ...candidate.reasons],
+      };
+    })
+    .sort((left, right) => right.score - left.score);
 };
 
 export const getVillageRecommendation = (input: {
@@ -904,59 +1248,79 @@ export const getVillageRecommendation = (input: {
   snapshot: VillageSnapshotLike;
   history: VillageSnapshotLike[];
   account: AccountStrategyContext;
-}): VillageRecommendation => {
-  const { villageName, snapshot, history, account } = input;
+}): VillageRecommendation => buildVillageDecision(input).recommendation;
 
-  if ((snapshot.incomingAttacksAmount ?? 0) > 0) {
+export const buildVillageDecision = (input: {
+  villageName: string;
+  snapshot: VillageSnapshotLike;
+  history: VillageSnapshotLike[];
+  account: AccountStrategyContext;
+}): VillageDecision => {
+  const { villageName, snapshot, history, account } = input;
+  const effectiveSnapshot = withEffectiveConstructionState(snapshot);
+
+  if ((effectiveSnapshot.incomingAttacksAmount ?? 0) > 0) {
     return {
-      priority: "critical",
-      title: "Manual review required",
-      summary: `${villageName} has incoming attacks, so resource spending should wait until the defense picture is clear.`,
-      score: 100,
-      shouldWait: false,
-      waitTimeText: null,
-      reasons: ["Incoming attacks override the normal population-growth strategy."],
-      memorySummary: "Threat state active; memory is ignored until the village is stable again.",
+      rankedCandidates: [],
+      memory: {
+        signals: {},
+        summary: "Threat state active; memory is ignored until the village is stable again.",
+      },
       focus: "Defensive pause",
-      strictRouteTitle: null,
-      strictRouteSummary: null,
-      strictRouteWaitTime: null,
-      strictRouteReasons: [],
-      snapshotRecommendationTitle: "Manual review required",
-      snapshotRecommendationSummary: `${villageName} has incoming attacks, so resource spending should wait until the defense picture is clear.`,
+      recommendation: {
+        priority: "critical",
+        title: "Manual review required",
+        summary: `${villageName} has incoming attacks, so resource spending should wait until the defense picture is clear.`,
+        score: 100,
+        shouldWait: false,
+        waitTimeText: null,
+        reasons: ["Incoming attacks override the normal population-growth strategy."],
+        memorySummary: "Threat state active; memory is ignored until the village is stable again.",
+        focus: "Defensive pause",
+        strictRouteTitle: null,
+        strictRouteSummary: null,
+        strictRouteWaitTime: null,
+        strictRouteReasons: [],
+        snapshotRecommendationTitle: "Manual review required",
+        snapshotRecommendationSummary: `${villageName} has incoming attacks, so resource spending should wait until the defense picture is clear.`,
+      },
     };
   }
 
-  const resources = getResourceBuckets(snapshot.resources);
-  const memory = buildMemoryProfile(history);
-  const candidates = buildCandidateList(snapshot, resources).map((candidate) =>
-    scoreCandidate({
-      candidate,
-      snapshot,
-      account,
-      resources,
-      memory,
-    }),
-  );
-  const selected = chooseCandidate(candidates);
+  const { memory, candidates, strictRoute } = buildHeuristicCandidates({
+    snapshot: effectiveSnapshot,
+    history,
+    account,
+  });
+  const rankedCandidates = applyStrictRoutePriority(candidates, strictRoute);
+  const selected = chooseCandidate(rankedCandidates);
+  const isSecondVillageRush = (account.usedVillageSlots ?? 1) < 2;
+  const focus = isSecondVillageRush
+    ? "Second village rush"
+    : "Population leaderboard growth";
 
   if (!selected) {
     return {
-      priority: "low",
-      title: "Review village manually",
-      summary: `No clear upgrade candidate was detected yet for ${villageName}.`,
-      score: 0,
-      shouldWait: false,
-      waitTimeText: null,
-      reasons: ["No candidate had enough cost and production data to score."],
-      memorySummary: memory.summary,
-      focus: "Population growth",
-      strictRouteTitle: null,
-      strictRouteSummary: null,
-      strictRouteWaitTime: null,
-      strictRouteReasons: [],
-      snapshotRecommendationTitle: "Review village manually",
-      snapshotRecommendationSummary: `No clear upgrade candidate was detected yet for ${villageName}.`,
+      rankedCandidates,
+      memory,
+      focus,
+      recommendation: {
+        priority: "low",
+        title: "Review village manually",
+        summary: `No clear upgrade candidate was detected yet for ${villageName}.`,
+        score: 0,
+        shouldWait: false,
+        waitTimeText: null,
+        reasons: ["No candidate had enough cost and production data to score."],
+        memorySummary: memory.summary,
+        focus,
+        strictRouteTitle: strictRoute?.title ?? null,
+        strictRouteSummary: strictRoute?.summary ?? null,
+        strictRouteWaitTime: strictRoute?.waitTimeText ?? null,
+        strictRouteReasons: strictRoute?.reasons ?? [],
+        snapshotRecommendationTitle: "Review village manually",
+        snapshotRecommendationSummary: `No clear upgrade candidate was detected yet for ${villageName}.`,
+      },
     };
   }
 
@@ -969,42 +1333,36 @@ export const getVillageRecommendation = (input: {
         : "low";
   const topReasons = selected.candidate.reasons.slice(0, 3);
   const summary = selected.shouldWait
-    ? `Wait ${waitTimeText ?? "a bit"} for ${selected.candidate.label}. It scores better for fast population growth than spending resources on a weaker option now.`
+    ? selected.candidate.blockedByConstructionQueue
+      ? `Wait ${waitTimeText ?? "for a construction slot"} for ${selected.candidate.label}. The village already has both construction slots occupied, so this move is not available yet even if the materials are ready.`
+      : `Wait ${waitTimeText ?? "a bit"} for ${selected.candidate.label}. It scores better for fast population growth than spending resources on a weaker option now.`
     : `${selected.candidate.label} is the best current move for population growth. ${topReasons
         .slice(1, 3)
         .join("; ")}.`;
-  const isSecondVillageRush = (account.usedVillageSlots ?? 1) < 2;
-  const strictRoute = isSecondVillageRush
-    ? getStrictRouteRecommendation({
-        snapshot,
-        account,
-        candidates,
-        resources,
-      })
-    : null;
-
   return {
-    priority,
-    title: strictRoute?.title ?? (selected.shouldWait
-      ? `Wait for ${selected.candidate.label}`
-      : selected.candidate.label),
-    summary: strictRoute?.summary ?? summary,
-    score: strictRoute?.score ?? selected.candidate.score,
-    shouldWait: strictRoute?.shouldWait ?? selected.shouldWait,
-    waitTimeText: strictRoute?.waitTimeText ?? waitTimeText,
-    reasons: strictRoute?.reasons ?? selected.candidate.reasons,
-    memorySummary: memory.summary,
-    focus:
-      isSecondVillageRush
-        ? "Second village rush"
-        : "Population leaderboard growth",
-    strictRouteTitle: strictRoute?.title ?? null,
-    strictRouteSummary: strictRoute?.summary ?? null,
-    strictRouteWaitTime: strictRoute?.waitTimeText ?? null,
-    strictRouteReasons: strictRoute?.reasons ?? [],
-    snapshotRecommendationTitle: selected.shouldWait
-      ? `Wait for ${selected.candidate.label}`
-      : selected.candidate.label,
-    snapshotRecommendationSummary: summary,
+    rankedCandidates,
+    memory,
+    focus,
+    recommendation: {
+      priority,
+      title: strictRoute?.title ?? (selected.shouldWait
+        ? `Wait for ${selected.candidate.label}`
+        : selected.candidate.label),
+      summary: strictRoute?.summary ?? summary,
+      score: strictRoute?.score ?? selected.candidate.score,
+      shouldWait: strictRoute?.shouldWait ?? selected.shouldWait,
+      waitTimeText: strictRoute?.waitTimeText ?? waitTimeText,
+      reasons: strictRoute?.reasons ?? selected.candidate.reasons,
+      memorySummary: memory.summary,
+      focus,
+      strictRouteTitle: strictRoute?.title ?? null,
+      strictRouteSummary: strictRoute?.summary ?? null,
+      strictRouteWaitTime: strictRoute?.waitTimeText ?? null,
+      strictRouteReasons: strictRoute?.reasons ?? [],
+      snapshotRecommendationTitle: selected.shouldWait
+        ? `Wait for ${selected.candidate.label}`
+        : selected.candidate.label,
+      snapshotRecommendationSummary: summary,
+    },
   };
 };

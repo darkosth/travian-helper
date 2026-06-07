@@ -1,5 +1,4 @@
 import { Badge } from "@/components/ui/badge";
-import { AgentProposalsPanel } from "@/components/agent-proposals-panel";
 import { AlertsRail } from "@/components/alerts-rail";
 import { HomeHero } from "@/components/home-hero";
 import { getCredentialSummary } from "@/lib/credentials";
@@ -20,7 +19,7 @@ export default async function CommandsPage() {
           Commands
         </Badge>
         <h1 className="mt-3 text-3xl font-semibold tracking-tight text-stone-50">
-          Command strips
+          Operaciones de captura
         </h1>
       </section>
 
@@ -32,7 +31,6 @@ export default async function CommandsPage() {
       />
 
       <AlertsRail alerts={dashboard.alerts} />
-      <AgentProposalsPanel villages={dashboard.villages} />
     </main>
   );
 }

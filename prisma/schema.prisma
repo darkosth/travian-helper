@@ -47,12 +47,16 @@ model Village {
   name        String
   x           Int?
   y           Int?
+  autoApplyEnabled Boolean      @default(false)
+  autoApplyPausedAt DateTime?
+  autoApplyPauseReason String?
   createdAt   DateTime          @default(now())
   updatedAt   DateTime          @updatedAt
   account     Account           @relation(fields: [accountId], references: [id], onDelete: Cascade)
   snapshots   VillageSnapshot[]
   captureRuns CaptureRunVillage[]
   proposals   AgentProposal[]
+  autoApplyJobs AutoApplyJob[]
 }
 
 model CaptureRun {
@@ -114,6 +118,8 @@ model VillageSnapshot {
   loyalty               Int?
   freeCrop              Int?
   incomingAttacksAmount Int?
+  activeConstructionSlots Int?
+  constructionQueueJson String?
   hasDorf1              Boolean  @default(false)
   hasDorf2              Boolean  @default(false)
   status                String
@@ -252,6 +258,7 @@ model ResourceFieldSnapshot {
   isMaxLevel          Boolean
   upgradeStatus       String
   canAffordUpgrade    Boolean?
+  canStartUpgradeNow  Boolean?
   nextLevelWood       Int?
   nextLevelClay       Int?
   nextLevelIron       Int?
@@ -290,4 +297,27 @@ model RawSnapshotPayload {
   payloadJson     String
   importedAt      DateTime @default(now())
   captureRun      CaptureRun @relation(fields: [captureRunId], references: [id], onDelete: Cascade)
+}
+
+model AutoApplyJob {
+  id                String   @id @default(cuid())
+  villageId         String
+  status            String
+  runAt             DateTime
+  notBefore         DateTime?
+  jitterMinutes     Int?
+  attemptCount      Int      @default(0)
+  lastError         String?
+  proposalId        String?
+  captureRunId      String?
+  lockToken         String?
+  lockedAt          DateTime?
+  processedAt       DateTime?
+  completedAt       DateTime?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+  village           Village  @relation(fields: [villageId], references: [id], onDelete: Cascade)
+
+  @@index([status, runAt])
+  @@index([villageId, status, runAt])
 }

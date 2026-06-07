@@ -1,5 +1,4 @@
 import { chromium, type Browser, type Page } from "playwright";
-import "server-only";
 import { db, ensureDatabase } from "@/lib/db";
 import { getCredentialSecret } from "@/lib/credentials";
 import {
@@ -8,9 +7,10 @@ import {
   persistSessionState,
   getSessionStatePath,
 } from "@/lib/playwright-session";
-import { loadDorf1Script, loadDorf2Script } from "@/lib/scripts";
+import { loadBuildMenuScript, loadDorf1Script, loadDorf2Script } from "@/lib/scripts";
 import { importVillageCapture } from "@/lib/snapshot-service";
 import { dorf1Schema } from "@/lib/travian-schemas";
+import type { Dorf2Snapshot } from "@/lib/travian-types";
 
 const buildVillageUrl = (serverUrl: string, path: string, villageId: number) => {
   const url = new URL(path, serverUrl);
@@ -251,6 +251,52 @@ const evaluateBrowserScript = async <T>(page: Page, script: string) =>
     return eval(source) as T;
   }, script);
 
+const getBuildMenuTargets = (dorf2Snapshot: Dorf2Snapshot) => {
+  const emptySlots = dorf2Snapshot.villageCenter.buildings
+    .filter((building) => building.isEmpty)
+    .map((building) => building.slot);
+  const firstNormalSlot = emptySlots.find((slot) => slot >= 19 && slot <= 38) ?? null;
+  const targets: Array<{ slot: number; categories: number[] }> = [];
+
+  if (firstNormalSlot !== null) {
+    targets.push({ slot: firstNormalSlot, categories: [1, 2] });
+  }
+
+  if (emptySlots.includes(39)) {
+    targets.push({ slot: 39, categories: [2] });
+  }
+
+  if (emptySlots.includes(40)) {
+    targets.push({ slot: 40, categories: [2] });
+  }
+
+  return targets;
+};
+
+const buildBuildMenuUrl = (serverUrl: string, slot: number, category: number | null = null) => {
+  const url = new URL("/build.php", serverUrl);
+  url.searchParams.set("id", String(slot));
+
+  if (category !== null) {
+    url.searchParams.set("category", String(category));
+  }
+
+  return url.toString();
+};
+
+const isDirectBuildActionHref = (targetHref: string | null | undefined, serverUrl: string) => {
+  if (!targetHref) {
+    return false;
+  }
+
+  try {
+    const url = new URL(targetHref, serverUrl);
+    return url.searchParams.get("action") === "build";
+  } catch {
+    return false;
+  }
+};
+
 const upgradeSelectors = [
   'button.green.build',
   'a.green.build',
@@ -286,6 +332,9 @@ const openUpgradeTarget = async (
     slot: number;
     villageExternalId: number;
     serverUrl: string;
+    buildAction?: "upgrade" | "construct";
+    targetGid?: number | null;
+    targetHref?: string | null;
   },
 ) => {
   if (input.kind === "resourceField") {
@@ -306,6 +355,18 @@ const openUpgradeTarget = async (
     ]);
 
     await page.waitForLoadState("networkidle", { timeout: 15_000 }).catch(() => undefined);
+    return;
+  }
+
+  if (input.buildAction === "construct" && input.targetHref) {
+    const buildUrl = new URL(input.targetHref, input.serverUrl);
+
+    if (input.targetGid !== null && input.targetGid !== undefined) {
+      buildUrl.searchParams.set("gid", String(input.targetGid));
+    }
+
+    await gotoTravianPage(page, buildUrl.toString());
+    await assertNoCaptcha(page, "Abrir solar vacio");
     return;
   }
 
@@ -402,6 +463,7 @@ export const runManualCapture = async () => {
     const page = await context.newPage();
     const dorf1Script = await loadDorf1Script();
     const dorf2Script = await loadDorf2Script();
+    const buildMenuScript = await loadBuildMenuScript();
 
     await gotoTravianPage(page, credentials.serverUrl);
 
@@ -470,7 +532,30 @@ export const runManualCapture = async () => {
         await waitForGentlePacing(page);
         await gotoTravianPage(page, buildVillageUrl(credentials.serverUrl, "/dorf2.php", village.id));
 
-        const dorf2Payload = await evaluateBrowserScript<unknown>(page, dorf2Script);
+        const dorf2Payload = await evaluateBrowserScript<Dorf2Snapshot>(page, dorf2Script);
+        const buildMenuSlots: Dorf2Snapshot["villageCenter"]["buildMenuSlots"] = [];
+
+        for (const target of getBuildMenuTargets(dorf2Payload)) {
+          for (const category of target.categories) {
+            await waitForGentlePacing(page);
+            await gotoTravianPage(
+              page,
+              buildBuildMenuUrl(credentials.serverUrl, target.slot, category),
+            );
+            await assertNoCaptcha(page, "Leer menu de construccion");
+
+            const buildMenuPayload = await evaluateBrowserScript<{
+              slot: number | null;
+              category: number | null;
+              activeTab: string | null;
+              options: Dorf2Snapshot["villageCenter"]["buildMenuSlots"][number]["options"];
+            }>(page, buildMenuScript);
+
+            buildMenuSlots.push(buildMenuPayload);
+          }
+        }
+
+        dorf2Payload.villageCenter.buildMenuSlots = buildMenuSlots;
 
         const result = await importVillageCapture({
           captureRunId: captureRun.id,
@@ -578,7 +663,10 @@ export const executeApprovedProposal = async (proposalId: string) => {
     return proposal.execution.id;
   }
 
-  const candidate = proposal.candidates[0];
+  const candidate =
+    proposal.selectedCandidateId
+      ? proposal.candidates.find((entry) => entry.id === proposal.selectedCandidateId) ?? null
+      : proposal.candidates[0] ?? null;
 
   if (!candidate) {
     throw new Error("Proposal has no candidate to execute.");
@@ -589,6 +677,26 @@ export const executeApprovedProposal = async (proposalId: string) => {
   }
 
   const credentials = await getCredentialSecret();
+  let candidateFeatures:
+    | {
+        buildAction?: "upgrade" | "construct";
+        targetGid?: number | null;
+        targetHref?: string | null;
+      }
+    | null = null;
+
+  try {
+    candidateFeatures =
+      candidate.featuresJson.length > 0
+        ? (JSON.parse(candidate.featuresJson) as {
+            buildAction?: "upgrade" | "construct";
+            targetGid?: number | null;
+            targetHref?: string | null;
+          })
+        : null;
+  } catch {
+    candidateFeatures = null;
+  }
 
   if (!credentials) {
     throw new Error("Missing saved credentials.");
@@ -621,9 +729,29 @@ export const executeApprovedProposal = async (proposalId: string) => {
       slot: candidate.slot,
       villageExternalId: proposal.village.externalId,
       serverUrl: credentials.serverUrl,
+      buildAction: candidateFeatures?.buildAction,
+      targetGid: candidateFeatures?.targetGid ?? null,
+      targetHref: candidateFeatures?.targetHref ?? null,
     });
 
-    await clickUpgradeAction(page);
+    const isDirectBuildAction =
+      candidateFeatures?.buildAction === "construct" &&
+      isDirectBuildActionHref(candidateFeatures?.targetHref, credentials.serverUrl);
+
+    if (!isDirectBuildAction) {
+      await clickUpgradeAction(page);
+    } else {
+      await assertNoCaptcha(page, "Construccion directa");
+
+      if (await isLoginPageVisible(page)) {
+        throw new Error(
+          [
+            "Construct action redirected back to login before the build could be confirmed.",
+            await getPageDiagnostic(page),
+          ].join(" "),
+        );
+      }
+    }
 
     await db.agentExecution.update({
       where: {

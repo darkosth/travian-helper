@@ -4,6 +4,16 @@ export type ResourceBucket = {
   capacity: number | null;
 };
 
+export type ActiveConstructionSnapshot = {
+  slot: number | null;
+  kind: "resourceField" | "building" | null;
+  name: string;
+  currentLevel: number | null;
+  targetLevel: number | null;
+  remainingTime: string | null;
+  finishTime: string | null;
+};
+
 export type Dorf1Snapshot = {
   schemaVersion: 1;
   source: "dorf1";
@@ -67,6 +77,7 @@ export type Dorf1Snapshot = {
       isMaxLevel: boolean;
       upgradeStatus: string;
       canAffordUpgrade: boolean | null;
+      canStartUpgradeNow: boolean | null;
       nextLevelCosts: {
         wood: number | null;
         clay: number | null;
@@ -75,6 +86,7 @@ export type Dorf1Snapshot = {
       } | null;
       upgradeDuration: string | null;
     }>;
+    activeConstructions: ActiveConstructionSnapshot[];
   };
   diagnostics: {
     resourceFieldCount: number;
@@ -107,6 +119,7 @@ export type Dorf2Snapshot = {
       emptySlots: number;
       upgradesAvailableNow: number;
       maxLevelBuildings: number;
+      activeConstructionSlots: number;
     };
     emptySlots: number[];
     buildings: Array<{
@@ -128,6 +141,27 @@ export type Dorf2Snapshot = {
       upgradeDuration: string | null;
       href: string | null;
     }>;
+    buildMenuSlots: Array<{
+      slot: number | null;
+      category: number | null;
+      activeTab: string | null;
+      options: Array<{
+        gid: number;
+        name: string;
+        category: number | null;
+        availableNow: boolean;
+        blockedReason: string | null;
+        nextLevelCosts: {
+          wood: number | null;
+          clay: number | null;
+          iron: number | null;
+          crop: number | null;
+        };
+        duration: string | null;
+        actionHref: string | null;
+      }>;
+    }>;
+    activeConstructions: ActiveConstructionSnapshot[];
   };
   diagnostics: {
     buildingCount: number;

@@ -1,5 +1,5 @@
-import "server-only";
 import { generateAgentProposals } from "@/lib/agent-proposals";
+import { syncAutoApplyJobsFromLatestRun } from "@/lib/auto-apply";
 import { db, ensureDatabase } from "@/lib/db";
 import { runManualCapture } from "@/lib/playwright-capture";
 
@@ -29,6 +29,7 @@ export const runCaptureAndGenerateProposals = async () => {
   }
 
   const proposalIds = await generateAgentProposals();
+  await syncAutoApplyJobsFromLatestRun();
 
   return {
     runId,

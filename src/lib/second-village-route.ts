@@ -135,7 +135,7 @@ export const secondVillageRoute: StrictRouteMilestone[] = [
     summary: "Keep the minimal route defense step without drifting into military spending.",
     target: {
       kind: "building",
-      names: ["city wall", "wall", "muralla", "empalizada", "earth wall"],
+      names: ["city wall", "wall", "muralla", "empalizada", "palisade", "earth wall"],
       targetLevel: 3,
     },
     reasons: ["Strict route defense minimum", "Cheap population"],
