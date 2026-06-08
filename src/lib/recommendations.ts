@@ -1064,8 +1064,7 @@ export const buildHeuristicCandidates = (input: {
       memory,
     }),
   );
-
-    const baseStrictRoute =
+  const baseStrictRoute =
     (account.usedVillageSlots ?? 1) < 2
       ? getStrictRouteRecommendation({
           snapshot,
@@ -1076,25 +1075,14 @@ export const buildHeuristicCandidates = (input: {
         })
       : null;
 
-      const storagePrerequisite =
-        baseStrictRoute?.candidate
-          ? findStoragePrerequisiteCandidate(
-              baseStrictRoute.candidate,
-              scoredCandidates,
-              resources,
-            )
-          : null;
-      // La ruta sigue apuntando a la Residencia, Academia, Ayuntamiento, etc.
-      // Pero si el costo no cabe físicamente, primero subimos el almacenamiento.
-      const strictRoute =
-        baseStrictRoute && storagePrerequisite
-          ? {
-              ...baseStrictRoute,
-              candidateId: storagePrerequisite.id,
-              candidate: storagePrerequisite,
-            }
-          : baseStrictRoute;
-          
+  // Durante el rush conservamos la ruta estricta como autoridad,
+  // pero insertamos Almacén o Granero si el siguiente hito no cabe físicamente.
+  const strictRoute = applyStoragePrerequisiteToStrictRoute(
+    baseStrictRoute,
+    scoredCandidates,
+    resources,
+  );
+
   const candidates =
     strictRoute?.candidate && !scoredCandidates.some((candidate) => candidate.id === strictRoute.candidateId)
       ? [...scoredCandidates, strictRoute.candidate]
@@ -1376,6 +1364,45 @@ const getStrictRouteRecommendation = (input: {
   };
 };
 
+const applyStoragePrerequisiteToStrictRoute = (
+  strictRoute: StrictRouteContext | null,
+  candidates: RecommendationCandidate[],
+  resources: Record<ResourceType, ResourceSnapshotLike>,
+): StrictRouteContext | null => {
+  if (!strictRoute?.candidate) {
+    return strictRoute;
+  }
+
+  const storagePrerequisite = findStoragePrerequisiteCandidate(
+    strictRoute.candidate,
+    candidates,
+    resources,
+  );
+
+  if (!storagePrerequisite) {
+    return strictRoute;
+  }
+
+  const waitTimeText = formatHoursToText(storagePrerequisite.timeToAffordHours);
+  const actionText = storagePrerequisite.affordableNow
+    ? `${storagePrerequisite.label} is available now.`
+    : `Wait ${waitTimeText ?? "until production catches up"} for ${storagePrerequisite.label}.`;
+
+  return {
+    ...strictRoute,
+    candidateId: storagePrerequisite.id,
+    candidate: storagePrerequisite,
+    title: storagePrerequisite.affordableNow
+      ? storagePrerequisite.label
+      : `Wait for ${storagePrerequisite.label}`,
+    summary: `${strictRoute.title} is blocked by storage capacity. ${actionText}`,
+    waitTimeText,
+    shouldWait: !storagePrerequisite.affordableNow,
+    reasons: [...strictRoute.reasons, ...storagePrerequisite.reasons],
+    score: Math.max(strictRoute.score, storagePrerequisite.score),
+  };
+};
+
 const applyStrictRoutePriority = (
   candidates: RecommendationCandidate[],
   strictRoute: StrictRouteContext | null,
@@ -1397,6 +1424,36 @@ const applyStrictRoutePriority = (
       };
     })
     .sort((left, right) => right.score - left.score);
+};
+
+type CandidateSelection = {
+  candidate: RecommendationCandidate;
+  shouldWait: boolean;
+};
+
+const applyStoragePrerequisiteToSelection = (
+  selection: CandidateSelection | null,
+  candidates: RecommendationCandidate[],
+  resources: Record<ResourceType, ResourceSnapshotLike>,
+): CandidateSelection | null => {
+  if (!selection) {
+    return null;
+  }
+
+  const storagePrerequisite = findStoragePrerequisiteCandidate(
+    selection.candidate,
+    candidates,
+    resources,
+  );
+
+  if (!storagePrerequisite) {
+    return selection;
+  }
+
+  return {
+    candidate: storagePrerequisite,
+    shouldWait: !storagePrerequisite.affordableNow,
+  };
 };
 
 export const getVillageRecommendation = (input: {
@@ -1443,13 +1500,21 @@ export const buildVillageDecision = (input: {
     };
   }
 
-  const { memory, candidates, strictRoute } = buildHeuristicCandidates({
+  const { resources, memory, candidates, strictRoute } = buildHeuristicCandidates({
     snapshot: effectiveSnapshot,
     history,
     account,
   });
   const rankedCandidates = applyStrictRoutePriority(candidates, strictRoute);
-  const selected = chooseCandidate(rankedCandidates);
+  const baseSelected = chooseCandidate(rankedCandidates);
+
+  // Regla transversal: cualquier recomendación imposible por capacidad
+  // se sustituye temporalmente por Almacén o Granero, incluso fuera del rush.
+  const selected = applyStoragePrerequisiteToSelection(
+    baseSelected,
+    rankedCandidates,
+    resources,
+  );
   const isSecondVillageRush = (account.usedVillageSlots ?? 1) < 2;
   const focus = isSecondVillageRush
     ? "Second village rush"
