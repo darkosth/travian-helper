@@ -3,12 +3,13 @@ import "dotenv/config";
 import {
   getAutoApplyWorkerWaitMs,
   processDueAutoApplyJobs,
-  syncAutoApplyJobsFromLatestRun,
+  refreshAutoApplyState,
 } from "../src/lib/auto-apply.ts";
 import { ensureDatabase } from "../src/lib/db.ts";
 
 const DEFAULT_WATCHDOG_MS = 8 * 60 * 1000;
 const WATCHDOG_MS = Number(process.env.AUTO_APPLY_CYCLE_TIMEOUT_MS ?? DEFAULT_WATCHDOG_MS);
+const MIN_LOOP_PAUSE_MS = 500;
 
 const sleep = (ms: number) =>
   new Promise((resolve) => {
@@ -17,10 +18,10 @@ const sleep = (ms: number) =>
 
 const formatDuration = (ms: number) => `${Math.round(ms / 1000)}s`;
 
-const runWithWatchdog = async (
+const runWithWatchdog = async <T>(
   label: string,
-  operation: () => Promise<void>,
-) => {
+  operation: () => Promise<T>,
+): Promise<T> => {
   const startedAt = Date.now();
 
   console.log(`[auto-apply-worker] ${label} started`);
@@ -35,33 +36,52 @@ const runWithWatchdog = async (
   }, WATCHDOG_MS);
 
   try {
-    await operation();
+    const result = await operation();
 
     console.log(
       `[auto-apply-worker] ${label} completed in ${formatDuration(Date.now() - startedAt)}`,
     );
+
+    return result;
   } finally {
     clearTimeout(watchdog);
   }
 };
 
+const refreshState = async (label: string) => {
+  await runWithWatchdog(label, async () => {
+    await refreshAutoApplyState();
+  });
+};
+
 const run = async () => {
   await ensureDatabase();
-
-  await runWithWatchdog("initial sync", async () => {
-    await syncAutoApplyJobsFromLatestRun();
-  });
+  await refreshState("initial account refresh");
 
   while (true) {
+    let processedJobs = 0;
+
     try {
-      await runWithWatchdog("processing cycle", async () => {
-        await processDueAutoApplyJobs();
-      });
+      processedJobs = await runWithWatchdog("processing one due job", async () =>
+        processDueAutoApplyJobs(),
+      );
     } catch (error) {
       console.error("[auto-apply-worker] process cycle failed", error);
     }
 
-    let waitMs = 60 * 60 * 1000;
+    // Después de una acción, recapturamos una sola vez para observar el resultado,
+    // generar la siguiente propuesta y programar el próximo job limpio.
+    if (processedJobs > 0) {
+      try {
+        await refreshState("post-action account refresh");
+      } catch (error) {
+        console.error("[auto-apply-worker] post-action refresh failed", error);
+      }
+
+      continue;
+    }
+
+    let waitMs = 5 * 60 * 1000;
 
     try {
       waitMs = await getAutoApplyWorkerWaitMs();
@@ -69,8 +89,17 @@ const run = async () => {
       console.error("[auto-apply-worker] failed to compute next wait", error);
     }
 
-    console.log(`[auto-apply-worker] sleeping for ${formatDuration(waitMs)}`);
-    await sleep(waitMs);
+    const safeWaitMs = Math.max(MIN_LOOP_PAUSE_MS, waitMs);
+    console.log(`[auto-apply-worker] sleeping for ${formatDuration(safeWaitMs)}`);
+    await sleep(safeWaitMs);
+
+    // Antes de intentar un job programado para el futuro, refrescamos el estado.
+    // Así evitamos actuar sobre recursos o colas antiguas.
+    try {
+      await refreshState("scheduled account refresh");
+    } catch (error) {
+      console.error("[auto-apply-worker] scheduled refresh failed", error);
+    }
   }
 };
 

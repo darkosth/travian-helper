@@ -349,12 +349,17 @@ const openUpgradeTarget = async (
       throw new Error(`Resource field slot ${input.slot} was not found.`);
     }
 
-    await Promise.all([
-      page.waitForLoadState("domcontentloaded", { timeout: 15_000 }).catch(() => undefined),
-      field.click(),
-    ]);
+    // Abrimos el href directamente para evitar problemas con capas visuales
+    // que puedan interceptar el click físico sobre el mapa de recursos.
+    const fieldHref = await field.getAttribute("href");
 
-    await page.waitForLoadState("networkidle", { timeout: 15_000 }).catch(() => undefined);
+    await gotoTravianPage(
+      page,
+      fieldHref
+        ? new URL(fieldHref, input.serverUrl).toString()
+        : buildBuildMenuUrl(input.serverUrl, input.slot),
+    );
+    await assertNoCaptcha(page, "Abrir campo");
     return;
   }
 
@@ -451,12 +456,37 @@ const openUpgradeTarget = async (
     throw new Error(`Building slot ${input.slot} was not found.`);
   }
 
-  await Promise.all([
-    page.waitForLoadState("domcontentloaded", { timeout: 15_000 }).catch(() => undefined),
-    building.click(),
-  ]);
+  // No hacemos click físico sobre el enlace visual del edificio.
+  // En algunas aldeas Travian coloca un SVG encima del enlace y Playwright
+  // queda esperando porque ese SVG intercepta los eventos del mouse.
+  // En su lugar leemos la URL real del onclick del mapa y navegamos directo.
+  const targetHref = await page.evaluate((slot) => {
+    const expectedSlot = String(slot);
+    const clickableElements = Array.from(document.querySelectorAll<HTMLElement>("[onclick]"));
 
-  await page.waitForLoadState("networkidle", { timeout: 15_000 }).catch(() => undefined);
+    for (const element of clickableElements) {
+      const onclick = element.getAttribute("onclick") ?? "";
+      const match = onclick.match(/['"]([^'"]*\/build\.php\?[^'"]+)['"]/i);
+
+      if (!match?.[1]) {
+        continue;
+      }
+
+      const url = new URL(match[1], window.location.origin);
+
+      if (url.pathname === "/build.php" && url.searchParams.get("id") === expectedSlot) {
+        return url.toString();
+      }
+    }
+
+    return null;
+  }, input.slot);
+
+  await gotoTravianPage(
+    page,
+    targetHref ?? buildBuildMenuUrl(input.serverUrl, input.slot),
+  );
+  await assertNoCaptcha(page, "Abrir edificio");
 };
 
 const isLoginPageVisible = async (page: Page) => {

@@ -8,7 +8,12 @@ import { db, ensureDatabase } from "@/lib/db";
 import { runManualCapture } from "@/lib/playwright-capture";
 import type { ActiveConstructionLike } from "@/lib/recommendations";
 
-const SAFETY_SWEEP_MS = 60 * 60 * 1000;
+// El MVP prioriza un flujo fácil de observar:
+// una captura global, un solo job por ciclo y una sola acción por job.
+const SAFETY_SWEEP_MS = 5 * 60 * 1000;
+const MIN_RETRY_DELAY_MS = 30 * 1000;
+const ERROR_RETRY_DELAY_MS = 60 * 1000;
+const QUEUE_FINISH_BUFFER_MS = 15 * 1000;
 const MAX_ATTEMPTS_BEFORE_PAUSE = 3;
 const ACTIVE_JOB_STATUSES = ["pending", "running"] as const;
 const STALE_RUNNING_JOB_MS = 2 * 60 * 1000;
@@ -25,27 +30,6 @@ const parseConstructionQueueJson = (value: string | null): ActiveConstructionLik
   }
 };
 
-const getJitterWindowForVillageCount = (villageCount: number) => {
-  if (villageCount <= 1) {
-    return {
-      min: 1,
-      max: 2,
-    };
-  }
-
-  if (villageCount <= 3) {
-    return {
-      min: 2,
-      max: 3,
-    };
-  }
-
-  return {
-    min: 3,
-    max: 5,
-  };
-};
-
 type AutoApplyCandidateLike = {
   affordableNow: boolean;
   category: string;
@@ -54,18 +38,8 @@ type AutoApplyCandidateLike = {
   finalScore?: number | null;
 };
 
-const buildJitterMinutes = async (accountId: string) => {
-  const villageCount = await db.village.count({
-    where: {
-      accountId,
-    },
-  });
-  const window = getJitterWindowForVillageCount(villageCount);
-
-  return window.min + Math.floor(Math.random() * (window.max - window.min + 1));
-};
-
-const addMinutes = (date: Date, minutes: number) => new Date(date.getTime() + minutes * 60_000);
+const addMilliseconds = (date: Date, milliseconds: number) =>
+  new Date(date.getTime() + milliseconds);
 
 const shouldAllowSafeSecondSlot = (input: {
   activeConstructionSlots: number | null | undefined;
@@ -75,12 +49,9 @@ const shouldAllowSafeSecondSlot = (input: {
     return true;
   }
 
-  const candidate = input.candidate;
-
-  // Relaxed safe mode: allow the second slot whenever the selected action
-  // is already affordable now. Risk controls stay in the surrounding flow
-  // via jitter, recapture, attack pauses, and repeated-failure pauses.
-  return Boolean(candidate?.affordableNow);
+  // Mientras exista un segundo slot libre, el MVP permite usarlo
+  // únicamente si la recomendación ya es pagable ahora mismo.
+  return Boolean(input.candidate?.affordableNow);
 };
 
 const markJobsCancelledForVillage = async (villageId: string, reason: string) => {
@@ -95,6 +66,8 @@ const markJobsCancelledForVillage = async (villageId: string, reason: string) =>
       status: "cancelled",
       lastError: reason,
       completedAt: new Date(),
+      lockToken: null,
+      lockedAt: null,
     },
   });
 };
@@ -126,6 +99,8 @@ export const pauseVillageAutoApply = async (input: {
       status: "paused",
       lastError: input.reason,
       completedAt: new Date(),
+      lockToken: null,
+      lockedAt: null,
     },
   });
 };
@@ -142,12 +117,39 @@ const clearVillagePause = async (villageId: string) => {
   });
 };
 
+const recoverStaleRunningJobs = async () => {
+  const staleBefore = new Date(Date.now() - STALE_RUNNING_JOB_MS);
+
+  await db.autoApplyJob.updateMany({
+    where: {
+      status: "running",
+      OR: [
+        {
+          lockedAt: {
+            lte: staleBefore,
+          },
+        },
+        {
+          lockedAt: null,
+        },
+      ],
+    },
+    data: {
+      status: "pending",
+      runAt: new Date(),
+      notBefore: new Date(),
+      lastError: "Recovered stale auto-apply worker lock.",
+      lockToken: null,
+      lockedAt: null,
+    },
+  });
+};
+
 const scheduleVillageJob = async (input: {
   villageId: string;
   runAt: Date;
   proposalId?: string | null;
   captureRunId?: string | null;
-  jitterMinutes: number;
   reason: string;
 }) => {
   const activeJobs = await db.autoApplyJob.findMany({
@@ -162,76 +164,58 @@ const scheduleVillageJob = async (input: {
     },
   });
 
-  const equivalentJobs = activeJobs.filter(
-    (job) => job.proposalId === (input.proposalId ?? null),
-  );
-  const runningEquivalentJob =
-    equivalentJobs.find((job) => job.status === "running") ?? null;
-  const pendingEquivalentJob =
-    equivalentJobs.find((job) => job.status === "pending") ?? null;
+  const runningJob = activeJobs.find((job) => job.status === "running") ?? null;
 
-  if (runningEquivalentJob) {
+  // Nunca creamos otro pending mientras esta aldea ya está ejecutando una acción.
+  // La captura posterior al job programará el siguiente intento limpio.
+  if (runningJob) {
     await db.autoApplyJob.updateMany({
       where: {
         villageId: input.villageId,
         status: "pending",
-        proposalId: input.proposalId ?? null,
       },
       data: {
         status: "cancelled",
-        lastError: `Superseded: ${input.reason}`,
+        lastError: `Superseded while village job is running: ${input.reason}`,
         completedAt: new Date(),
       },
     });
 
-    return runningEquivalentJob;
+    return runningJob;
   }
 
-  if (pendingEquivalentJob) {
+  const pendingJob = activeJobs.find((job) => job.status === "pending") ?? null;
+
+  if (pendingJob) {
     await db.autoApplyJob.updateMany({
       where: {
         villageId: input.villageId,
         status: "pending",
-        proposalId: input.proposalId ?? null,
         id: {
-          not: pendingEquivalentJob.id,
+          not: pendingJob.id,
         },
       },
       data: {
         status: "cancelled",
-        lastError: `Superseded: ${input.reason}`,
+        lastError: `Superseded duplicate pending job: ${input.reason}`,
         completedAt: new Date(),
       },
     });
 
-    if (input.runAt.getTime() < pendingEquivalentJob.runAt.getTime()) {
-      return db.autoApplyJob.update({
-        where: {
-          id: pendingEquivalentJob.id,
-        },
-        data: {
-          runAt: input.runAt,
-          notBefore: input.runAt,
-          jitterMinutes: input.jitterMinutes,
-          captureRunId: input.captureRunId ?? null,
-        },
-      });
-    }
-
-    return pendingEquivalentJob;
+    return db.autoApplyJob.update({
+      where: {
+        id: pendingJob.id,
+      },
+      data: {
+        runAt: input.runAt,
+        notBefore: input.runAt,
+        jitterMinutes: 0,
+        proposalId: input.proposalId ?? null,
+        captureRunId: input.captureRunId ?? null,
+        lastError: null,
+      },
+    });
   }
-
-  await db.autoApplyJob.updateMany({
-    where: {
-      villageId: input.villageId,
-      status: "pending",
-    },
-    data: {
-      status: "cancelled",
-      lastError: `Superseded: ${input.reason}`,
-      completedAt: new Date(),
-    },
-  });
 
   return db.autoApplyJob.create({
     data: {
@@ -239,7 +223,7 @@ const scheduleVillageJob = async (input: {
       status: "pending",
       runAt: input.runAt,
       notBefore: input.runAt,
-      jitterMinutes: input.jitterMinutes,
+      jitterMinutes: 0,
       proposalId: input.proposalId ?? null,
       captureRunId: input.captureRunId ?? null,
     },
@@ -284,8 +268,25 @@ const getLatestVillageAutomationState = async (villageId: string) => {
   };
 };
 
+const getCandidateDelayMs = (candidate: AutoApplyCandidateLike | null) => {
+  if (!candidate) {
+    return SAFETY_SWEEP_MS;
+  }
+
+  if (candidate.affordableNow) {
+    return 0;
+  }
+
+  if (candidate.timeToAffordHours === null || candidate.timeToAffordHours === undefined) {
+    return SAFETY_SWEEP_MS;
+  }
+
+  return Math.max(MIN_RETRY_DELAY_MS, candidate.timeToAffordHours * 60 * 60 * 1000);
+};
+
 export const syncAutoApplyJobsFromLatestRun = async () => {
   await ensureDatabase();
+  await recoverStaleRunningJobs();
 
   const villages = await db.village.findMany({
     where: {
@@ -325,11 +326,11 @@ export const syncAutoApplyJobsFromLatestRun = async () => {
     const snapshot = village.snapshots[0] ?? null;
     const proposal = village.proposals[0] ?? null;
 
-    if (!snapshot) {
-      continue;
-    }
-
-    if (!proposal) {
+    if (!snapshot || !proposal) {
+      await markJobsCancelledForVillage(
+        village.id,
+        !snapshot ? "Missing current village snapshot." : "Missing pending proposal.",
+      );
       continue;
     }
 
@@ -341,58 +342,70 @@ export const syncAutoApplyJobsFromLatestRun = async () => {
       continue;
     }
 
+    const constructionQueue = parseConstructionQueueJson(snapshot.constructionQueueJson);
     const effectiveConstruction = getEffectiveConstructionState({
       activeConstructionSlots: snapshot.activeConstructionSlots,
-      constructionQueue: parseConstructionQueueJson(snapshot.constructionQueueJson),
+      constructionQueue,
       scrapedAt: snapshot.scrapedAt,
     });
-    const jitterMinutes = await buildJitterMinutes(village.accountId);
     const queueDelayMs = getSoonestQueueDelayMs({
       activeConstructionSlots: snapshot.activeConstructionSlots,
-      constructionQueue: parseConstructionQueueJson(snapshot.constructionQueueJson),
+      constructionQueue,
       scrapedAt: snapshot.scrapedAt,
     });
-    const topCandidate = proposal?.candidates[0] ?? null;
+    const topCandidate = proposal.candidates[0] ?? null;
+    const candidateLike = topCandidate
+      ? {
+          affordableNow: topCandidate.affordableNow,
+          category: topCandidate.category,
+          totalCost: topCandidate.totalCost,
+          timeToAffordHours: topCandidate.timeToAffordHours,
+          finalScore: topCandidate.finalScore,
+        }
+      : null;
     const canUseSecondSlotNow = shouldAllowSafeSecondSlot({
       activeConstructionSlots: effectiveConstruction.activeConstructionSlots,
-      candidate: topCandidate
-        ? {
-            affordableNow: topCandidate.affordableNow,
-            category: topCandidate.category,
-            totalCost: topCandidate.totalCost,
-            timeToAffordHours: topCandidate.timeToAffordHours,
-            finalScore: topCandidate.finalScore,
-          }
-        : null,
+      candidate: candidateLike,
     });
+    const hasFreeSlot = effectiveConstruction.activeConstructionSlots < 2;
     const shouldRunImmediately =
-      effectiveConstruction.activeConstructionSlots < 2 &&
-      Boolean(topCandidate?.affordableNow) &&
-      canUseSecondSlotNow;
-    const baseDelayMs =
-      effectiveConstruction.queueExpiredByClock && effectiveConstruction.activeConstructionSlots === 0
-        ? 0
-        : !canUseSecondSlotNow && effectiveConstruction.activeConstructionSlots >= 1
-        ? queueDelayMs ?? SAFETY_SWEEP_MS
-        : queueDelayMs ??
-          (topCandidate?.timeToAffordHours !== null && topCandidate?.timeToAffordHours !== undefined
-            ? topCandidate.timeToAffordHours * 60 * 60 * 1000
-            : topCandidate?.affordableNow
-              ? 0
-              : SAFETY_SWEEP_MS);
-    const runAt = shouldRunImmediately
-      ? new Date(Date.now())
-      : addMinutes(new Date(Date.now() + baseDelayMs), jitterMinutes);
+      hasFreeSlot && Boolean(topCandidate?.affordableNow) && canUseSecondSlotNow;
+
+    let delayMs = 0;
+    let reason = "ready-now";
+
+    if (!shouldRunImmediately) {
+      if (!hasFreeSlot || !canUseSecondSlotNow) {
+        delayMs = Math.max(
+          MIN_RETRY_DELAY_MS,
+          (queueDelayMs ?? SAFETY_SWEEP_MS) + QUEUE_FINISH_BUFFER_MS,
+        );
+        reason = "queue-delay";
+      } else {
+        delayMs = getCandidateDelayMs(candidateLike);
+        reason = "resource-delay";
+      }
+    }
 
     await scheduleVillageJob({
       villageId: village.id,
-      runAt,
-      proposalId: proposal?.id ?? null,
+      runAt: addMilliseconds(new Date(), delayMs),
+      proposalId: proposal.id,
       captureRunId: snapshot.captureRunId,
-      jitterMinutes: shouldRunImmediately ? 0 : jitterMinutes,
-      reason: queueDelayMs !== null ? "queue-delay" : "proposal-delay",
+      reason,
     });
   }
+};
+
+export const refreshAutoApplyState = async () => {
+  await ensureDatabase();
+  await recoverStaleRunningJobs();
+
+  const captureRunId = await runManualCapture();
+  await generateAgentProposals();
+  await syncAutoApplyJobsFromLatestRun();
+
+  return captureRunId;
 };
 
 export const setVillageAutoApply = async (input: {
@@ -444,27 +457,6 @@ const getNextPendingJob = async () =>
     },
   });
 
-const recoverStaleRunningJobs = async () => {
-  const staleBefore = new Date(Date.now() - STALE_RUNNING_JOB_MS);
-
-  await db.autoApplyJob.updateMany({
-    where: {
-      status: "running",
-      lockedAt: {
-        lte: staleBefore,
-      },
-    },
-    data: {
-      status: "pending",
-      runAt: new Date(),
-      notBefore: new Date(),
-      lastError: "Recovered stale auto-apply worker lock.",
-      lockToken: null,
-      lockedAt: null,
-    },
-  });
-};
-
 const claimJob = async (jobId: string) => {
   const lockToken = randomUUID();
   const updateResult = await db.autoApplyJob.updateMany({
@@ -502,12 +494,13 @@ const finishJob = async (jobId: string, status: string, lastError?: string | nul
   });
 };
 
-const refreshAccountState = async () => {
-  const captureRunId = await runManualCapture();
-  await generateAgentProposals();
-  await syncAutoApplyJobsFromLatestRun();
-  return captureRunId;
-};
+const isDeterministicFailure = (message: string) =>
+  /captcha|login|anti-bot|no confirmó el inicio de la construcción|Building slot \d+ was not found|Resource field slot \d+ was not found|No se encontró un botón directo para construir/i.test(
+    message,
+  );
+
+const isStaleProposalFailure = (message: string) =>
+  /The village changed after this proposal was generated|Regenerate it first/i.test(message);
 
 export const processAutoApplyJob = async (jobId: string) => {
   await ensureDatabase();
@@ -515,7 +508,7 @@ export const processAutoApplyJob = async (jobId: string) => {
   const lockToken = await claimJob(jobId);
 
   if (!lockToken) {
-    return;
+    return false;
   }
 
   const job = await db.autoApplyJob.findUnique({
@@ -528,25 +521,27 @@ export const processAutoApplyJob = async (jobId: string) => {
   });
 
   if (!job) {
-    return;
+    return false;
   }
 
   try {
     if (!job.village.autoApplyEnabled) {
       await finishJob(job.id, "cancelled", "Auto-apply disabled.");
-      return;
+      return true;
     }
 
     if (job.village.autoApplyPausedAt) {
       await finishJob(job.id, "paused", job.village.autoApplyPauseReason ?? "Village paused.");
-      return;
+      return true;
     }
 
-    const captureRunId = await refreshAccountState();
+    // Importante: aquí NO hacemos una captura global.
+    // El worker refresca la cuenta antes de programar jobs y después de cada acción.
     const latest = await getLatestVillageAutomationState(job.villageId);
 
     if (!latest.village || !latest.snapshot) {
-      throw new Error("Village snapshot missing after refresh.");
+      await finishJob(job.id, "done", "Village snapshot missing. Refresh required.");
+      return true;
     }
 
     if ((latest.snapshot.incomingAttacksAmount ?? 0) > 0) {
@@ -555,7 +550,7 @@ export const processAutoApplyJob = async (jobId: string) => {
         reason: "Incoming attacks detected.",
       });
       await finishJob(job.id, "paused", "Incoming attacks detected.");
-      return;
+      return true;
     }
 
     const proposal = latest.proposal;
@@ -563,12 +558,13 @@ export const processAutoApplyJob = async (jobId: string) => {
       proposal?.candidates.find((candidate) => candidate.isRecommended) ??
       proposal?.candidates[0] ??
       null;
+    const effectiveConstruction = getEffectiveConstructionState({
+      activeConstructionSlots: latest.snapshot.activeConstructionSlots,
+      constructionQueue: parseConstructionQueueJson(latest.snapshot.constructionQueueJson),
+      scrapedAt: latest.snapshot.scrapedAt,
+    });
     const canUseSecondSlotNow = shouldAllowSafeSecondSlot({
-      activeConstructionSlots: getEffectiveConstructionState({
-        activeConstructionSlots: latest.snapshot.activeConstructionSlots,
-        constructionQueue: parseConstructionQueueJson(latest.snapshot.constructionQueueJson),
-        scrapedAt: latest.snapshot.scrapedAt,
-      }).activeConstructionSlots,
+      activeConstructionSlots: effectiveConstruction.activeConstructionSlots,
       candidate: selectedCandidate
         ? {
             affordableNow: selectedCandidate.affordableNow,
@@ -584,29 +580,35 @@ export const processAutoApplyJob = async (jobId: string) => {
       !proposal ||
       !selectedCandidate ||
       !selectedCandidate.affordableNow ||
+      effectiveConstruction.activeConstructionSlots >= 2 ||
       !canUseSecondSlotNow
     ) {
-      await syncAutoApplyJobsFromLatestRun();
-      await finishJob(job.id, "done", "Refreshed and rescheduled.");
-      return;
+      await finishJob(job.id, "done", "Current state is not actionable. Refresh required.");
+      return true;
     }
 
     await approveAgentProposal(proposal.id, selectedCandidate.id);
-    await db.autoApplyJob.update({
-      where: {
-        id: job.id,
-      },
-      data: {
-        proposalId: proposal.id,
-        captureRunId,
-      },
-    });
-
-    await refreshAccountState();
     await finishJob(job.id, "done");
+
+    return true;
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown auto-apply failure.";
-    const nextRunAt = addMinutes(new Date(), await buildJitterMinutes(job.village.accountId));
+
+    if (isStaleProposalFailure(message)) {
+      await finishJob(job.id, "done", "Proposal became stale. Refresh required.");
+      return true;
+    }
+
+    if (isDeterministicFailure(message)) {
+      await pauseVillageAutoApply({
+        villageId: job.villageId,
+        reason: message,
+      });
+      await finishJob(job.id, "paused", message);
+      return true;
+    }
+
+    const nextRunAt = addMilliseconds(new Date(), ERROR_RETRY_DELAY_MS);
     const updateResult = await db.autoApplyJob.updateMany({
       where: {
         id: job.id,
@@ -618,13 +620,14 @@ export const processAutoApplyJob = async (jobId: string) => {
           increment: 1,
         },
         runAt: nextRunAt,
+        notBefore: nextRunAt,
         lockToken: null,
         lockedAt: null,
       },
     });
 
     if (updateResult.count === 0) {
-      return;
+      return true;
     }
 
     const updated = await db.autoApplyJob.findUnique({
@@ -633,20 +636,15 @@ export const processAutoApplyJob = async (jobId: string) => {
       },
     });
 
-    if (!updated) {
-      return;
-    }
-
-    if (
-      updated.attemptCount >= MAX_ATTEMPTS_BEFORE_PAUSE ||
-      /captcha|login|anti-bot|no confirmó el inicio de la construcción|Building slot \d+ was not found|Resource field slot \d+ was not found/i.test(message)
-    ) {
+    if (updated && updated.attemptCount >= MAX_ATTEMPTS_BEFORE_PAUSE) {
       await pauseVillageAutoApply({
         villageId: job.villageId,
         reason: message,
       });
       await finishJob(job.id, "paused", message);
     }
+
+    return true;
   }
 };
 
@@ -670,34 +668,47 @@ export const listVillageAutoApplyState = async (villageIds: string[]) => {
       villageId: {
         in: villageIds,
       },
-      // El dashboard solo debe mostrar jobs realmente activos.
-      // Las pausas históricas permanecen en SQLite para auditoría,
-      // pero no representan el próximo intento actual.
       status: {
         in: ["pending", "running"],
       },
     },
     orderBy: {
-      runAt: "asc",
+      updatedAt: "desc",
     },
   });
 
-  const latestByVillage = new Map<string, (typeof jobs)[number]>();
+  const activeByVillage = new Map<string, (typeof jobs)[number]>();
 
   for (const job of jobs) {
-    if (!latestByVillage.has(job.villageId)) {
-      latestByVillage.set(job.villageId, job);
+    const current = activeByVillage.get(job.villageId);
+
+    if (!current) {
+      activeByVillage.set(job.villageId, job);
+      continue;
+    }
+
+    if (current.status !== "running" && job.status === "running") {
+      activeByVillage.set(job.villageId, job);
+      continue;
+    }
+
+    if (
+      current.status === "pending" &&
+      job.status === "pending" &&
+      job.runAt.getTime() < current.runAt.getTime()
+    ) {
+      activeByVillage.set(job.villageId, job);
     }
   }
 
-  return latestByVillage;
+  return activeByVillage;
 };
 
 export const processDueAutoApplyJobs = async () => {
   await ensureDatabase();
   await recoverStaleRunningJobs();
 
-  const dueJobs = await db.autoApplyJob.findMany({
+  const dueJob = await db.autoApplyJob.findFirst({
     where: {
       status: "pending",
       runAt: {
@@ -707,12 +718,12 @@ export const processDueAutoApplyJobs = async () => {
     orderBy: {
       runAt: "asc",
     },
-    // Cada job puede realizar capturas Playwright costosas.
-    // Procesamos uno por ciclo para evitar tandas demasiado largas.
-    take: 1,
   });
 
-  for (const job of dueJobs) {
-    await processAutoApplyJob(job.id);
+  if (!dueJob) {
+    return 0;
   }
+
+  await processAutoApplyJob(dueJob.id);
+  return 1;
 };
