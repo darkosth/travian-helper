@@ -135,6 +135,18 @@ type MemorySignal = {
   sampleCount: number;
 };
 
+type UpgradeCostLike = Pick<
+  RecommendationCandidate,
+  "nextLevelWood" | "nextLevelClay" | "nextLevelIron" | "nextLevelCrop"
+>;
+
+type StorageBlocker = {
+  category: "warehouse" | "granary";
+  currentCapacity: number;
+  requiredCapacity: number;
+  blockedResources: ResourceType[];
+};
+
 export type MemoryProfile = {
   signals: Partial<Record<CandidateCategory, MemorySignal>>;
   summary: string;
@@ -272,6 +284,12 @@ const getTimeToAffordHours = (
           : type === "iron"
             ? candidate.nextLevelIron ?? 0
             : candidate.nextLevelCrop ?? 0;
+    
+    const capacity = resources[type].capacity;
+    // No calculamos una espera ficticia si el recurso nunca cabrá.
+    if (capacity !== null && required > capacity) {
+      return null;
+    }
     const missing = Math.max(0, required - amount);
 
     if (missing === 0) {
@@ -306,6 +324,123 @@ const getMissingResources = (
   iron: Math.max(0, (candidate.nextLevelIron ?? 0) - (resources.iron.amount ?? 0)),
   crop: Math.max(0, (candidate.nextLevelCrop ?? 0) - (resources.crop.amount ?? 0)),
 });
+
+const getRequiredAmount = (
+  candidate: UpgradeCostLike,
+  type: ResourceType,
+) => {
+  switch (type) {
+    case "wood":
+      return candidate.nextLevelWood ?? 0;
+    case "clay":
+      return candidate.nextLevelClay ?? 0;
+    case "iron":
+      return candidate.nextLevelIron ?? 0;
+    case "crop":
+      return candidate.nextLevelCrop ?? 0;
+  }
+};
+
+const getStorageBlocker = (
+  candidate: UpgradeCostLike,
+  resources: Record<ResourceType, ResourceSnapshotLike>,
+): StorageBlocker | null => {
+  // Madera, barro y hierro comparten la capacidad del almacén.
+  const warehouseCapacity =
+    resources.wood.capacity ??
+    resources.clay.capacity ??
+    resources.iron.capacity;
+
+  const warehouseResourceTypes: ResourceType[] = [
+    "wood",
+    "clay",
+    "iron",
+  ];
+
+  const blockedWarehouseResources =
+    warehouseCapacity === null
+      ? []
+      : warehouseResourceTypes.filter(
+          (type) => getRequiredAmount(candidate, type) > warehouseCapacity,
+        );
+
+  const blockers: StorageBlocker[] = [];
+
+  if (
+    warehouseCapacity !== null &&
+    blockedWarehouseResources.length > 0
+  ) {
+    blockers.push({
+      category: "warehouse",
+      currentCapacity: warehouseCapacity,
+      requiredCapacity: Math.max(
+        ...blockedWarehouseResources.map((type) =>
+          getRequiredAmount(candidate, type),
+        ),
+      ),
+      blockedResources: blockedWarehouseResources,
+    });
+  }
+
+  // El cereal usa una capacidad independiente: el granero.
+  const granaryCapacity = resources.crop.capacity;
+  const requiredCrop = getRequiredAmount(candidate, "crop");
+
+  if (granaryCapacity !== null && requiredCrop > granaryCapacity) {
+    blockers.push({
+      category: "granary",
+      currentCapacity: granaryCapacity,
+      requiredCapacity: requiredCrop,
+      blockedResources: ["crop"],
+    });
+  }
+
+  // Si fallan ambos almacenamientos, atendemos primero el déficit proporcional mayor.
+  return (
+    blockers.sort(
+      (left, right) =>
+        right.requiredCapacity / Math.max(1, right.currentCapacity) -
+        left.requiredCapacity / Math.max(1, left.currentCapacity),
+    )[0] ?? null
+  );
+};
+
+const findStoragePrerequisiteCandidate = (
+  blockedCandidate: RecommendationCandidate,
+  candidates: RecommendationCandidate[],
+  resources: Record<ResourceType, ResourceSnapshotLike>,
+): RecommendationCandidate | null => {
+  const blocker = getStorageBlocker(blockedCandidate, resources);
+
+  if (!blocker) {
+    return null;
+  }
+
+  const storageCandidate =
+    candidates
+      .filter((candidate) => candidate.category === blocker.category)
+      // Evitamos elegir una mejora de almacenamiento que también sea imposible.
+      .filter((candidate) => getStorageBlocker(candidate, resources) === null)
+      .sort(
+        (left, right) =>
+          Number(right.affordableNow) - Number(left.affordableNow) ||
+          (left.timeToAffordHours ?? Number.POSITIVE_INFINITY) -
+            (right.timeToAffordHours ?? Number.POSITIVE_INFINITY) ||
+          left.totalCost - right.totalCost,
+      )[0] ?? null;
+
+  if (!storageCandidate) {
+    return null;
+  }
+
+  return {
+    ...storageCandidate,
+    reasons: [
+      ...storageCandidate.reasons,
+      `Storage prerequisite for ${blockedCandidate.name}: ${blocker.category} capacity ${blocker.currentCapacity}/${blocker.requiredCapacity}`,
+    ],
+  };
+};
 
 const combineWaitHours = (input: {
   baseWaitHours: number | null;
@@ -929,7 +1064,8 @@ export const buildHeuristicCandidates = (input: {
       memory,
     }),
   );
-  const strictRoute =
+
+    const baseStrictRoute =
     (account.usedVillageSlots ?? 1) < 2
       ? getStrictRouteRecommendation({
           snapshot,
@@ -939,6 +1075,26 @@ export const buildHeuristicCandidates = (input: {
           memory,
         })
       : null;
+
+      const storagePrerequisite =
+        baseStrictRoute?.candidate
+          ? findStoragePrerequisiteCandidate(
+              baseStrictRoute.candidate,
+              scoredCandidates,
+              resources,
+            )
+          : null;
+      // La ruta sigue apuntando a la Residencia, Academia, Ayuntamiento, etc.
+      // Pero si el costo no cabe físicamente, primero subimos el almacenamiento.
+      const strictRoute =
+        baseStrictRoute && storagePrerequisite
+          ? {
+              ...baseStrictRoute,
+              candidateId: storagePrerequisite.id,
+              candidate: storagePrerequisite,
+            }
+          : baseStrictRoute;
+          
   const candidates =
     strictRoute?.candidate && !scoredCandidates.some((candidate) => candidate.id === strictRoute.candidateId)
       ? [...scoredCandidates, strictRoute.candidate]
