@@ -215,6 +215,11 @@ export function VillageDashboard({ villages }: VillageDashboardProps) {
       return "Sin job programado.";
     }
 
+    if (selectedVillage.autoApplyJob.status === "running") {
+      return selectedVillage.activeConstructionSlots === 0
+        ? "Procesando auto-apply ahora."
+        : `Cola ${selectedVillage.activeConstructionSlots}/2 · procesando ahora`;
+    }
     if (selectedVillage.activeConstructionSlots === 0) {
       return `Esperando jitter · próximo intento ${formatRelativeTime(
         selectedVillage.autoApplyJob.runAt,

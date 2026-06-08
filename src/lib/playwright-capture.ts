@@ -358,16 +358,86 @@ const openUpgradeTarget = async (
     return;
   }
 
-  if (input.buildAction === "construct" && input.targetHref) {
-    const buildUrl = new URL(input.targetHref, input.serverUrl);
+  if (input.buildAction === "construct") {
+    // Para una construcción nueva no reutilizamos targetHref.
+    // Ese href incluye checksum y puede expirar o quedar ligado a otra sesión.
+    // Abrimos el menú otra vez y hacemos clic en el botón recién generado.
+    await gotoTravianPage(
+      page,
+      buildVillageUrl(input.serverUrl, "/dorf2.php", input.villageExternalId),
+    );
+    await assertVillagePageLoaded(page, "Cambiar a aldea objetivo");
 
-    if (input.targetGid !== null && input.targetGid !== undefined) {
-      buildUrl.searchParams.set("gid", String(input.targetGid));
+    if (input.targetGid === null || input.targetGid === undefined) {
+      throw new Error(`Missing target gid for construct action in slot ${input.slot}.`);
     }
 
-    await gotoTravianPage(page, buildUrl.toString());
-    await assertNoCaptcha(page, "Abrir solar vacio");
-    return;
+    const categoriesToTry: Array<number | null> = [null, 1, 2];
+    const diagnostics: string[] = [];
+
+    for (const category of categoriesToTry) {
+      await gotoTravianPage(
+        page,
+        buildBuildMenuUrl(input.serverUrl, input.slot, category),
+      );
+      await assertNoCaptcha(page, "Abrir menu de construccion");
+
+      if (await isLoginPageVisible(page)) {
+        throw new Error(
+          [
+            "Construct action redirected back to login while opening the fresh build menu.",
+            await getPageDiagnostic(page),
+          ].join(" "),
+        );
+      }
+
+      const wrapper = page.locator(`#contract_building${input.targetGid}`).first();
+
+      if ((await wrapper.count()) === 0) {
+        diagnostics.push(
+          `category=${category ?? "default"}: wrapper contract_building${input.targetGid} no encontrado`,
+        );
+        continue;
+      }
+
+      const directBuildAction = wrapper
+        .locator(
+          [
+            'a[href*="action=build"]:not([href*="buildmaster"])',
+            'button[onclick*="action=build"]:not([onclick*="buildmaster"])',
+          ].join(", "),
+        )
+        .first();
+
+      if ((await directBuildAction.count()) === 0) {
+        const wrapperText = await wrapper
+          .innerText()
+          .then((value) => value.replace(/\s+/g, " ").trim().slice(0, 500))
+          .catch(() => "");
+
+        diagnostics.push(
+          `category=${category ?? "default"}: edificio encontrado sin boton directo. Texto: ${wrapperText}`,
+        );
+        continue;
+      }
+
+      await Promise.all([
+        page.waitForLoadState("domcontentloaded", { timeout: 15_000 }).catch(() => undefined),
+        directBuildAction.click(),
+      ]);
+
+      await page.waitForLoadState("networkidle", { timeout: 15_000 }).catch(() => undefined);
+      await assertNoCaptcha(page, "Ejecutar construccion desde menu fresco");
+      return;
+    }
+
+    throw new Error(
+      [
+        `No se encontró un botón directo para construir gid ${input.targetGid} en el slot ${input.slot}.`,
+        ...diagnostics,
+        await getPageDiagnostic(page),
+      ].join(" "),
+    );
   }
 
   await gotoTravianPage(page, buildVillageUrl(input.serverUrl, "/dorf2.php", input.villageExternalId));
@@ -633,6 +703,86 @@ export const runManualCapture = async () => {
   }
 };
 
+const readVillageCenterSnapshot = async (
+  page: Page,
+  input: {
+    serverUrl: string;
+    villageExternalId: number;
+    dorf2Script: string;
+    contextLabel: string;
+  },
+) => {
+  await gotoTravianPage(
+    page,
+    buildVillageUrl(input.serverUrl, "/dorf2.php", input.villageExternalId),
+  );
+  await assertVillagePageLoaded(page, input.contextLabel);
+
+  return evaluateBrowserScript<Dorf2Snapshot>(page, input.dorf2Script);
+};
+
+const didConstructionStateChange = (
+  beforeSnapshot: Dorf2Snapshot,
+  afterSnapshot: Dorf2Snapshot,
+  targetSlot: number,
+) => {
+  const beforeTarget =
+    beforeSnapshot.villageCenter.buildings.find((building) => building.slot === targetSlot) ?? null;
+  const afterTarget =
+    afterSnapshot.villageCenter.buildings.find((building) => building.slot === targetSlot) ?? null;
+
+  const beforeQueue = beforeSnapshot.villageCenter.activeConstructions;
+  const afterQueue = afterSnapshot.villageCenter.activeConstructions;
+
+  const queueIncreased = afterQueue.length > beforeQueue.length;
+  const targetEnteredQueue =
+    !beforeQueue.some((construction) => construction.slot === targetSlot) &&
+    afterQueue.some((construction) => construction.slot === targetSlot);
+
+  const targetChanged = Boolean(
+    beforeTarget &&
+      afterTarget &&
+      (beforeTarget.isEmpty !== afterTarget.isEmpty ||
+        beforeTarget.gid !== afterTarget.gid ||
+        beforeTarget.level !== afterTarget.level),
+  );
+
+  return queueIncreased || targetEnteredQueue || targetChanged;
+};
+
+const confirmBuildStarted = async (
+  page: Page,
+  input: {
+    serverUrl: string;
+    villageExternalId: number;
+    dorf2Script: string;
+    targetSlot: number;
+    beforeSnapshot: Dorf2Snapshot;
+  },
+) => {
+  // Travian puede tardar un momento en reflejar la nueva cola.
+  // Reintentamos antes de decidir que la acción realmente falló.
+  for (const waitMs of [750, 1_500, 2_500]) {
+    await waitForGentlePacing(page, waitMs);
+
+    const afterSnapshot = await readVillageCenterSnapshot(page, {
+      serverUrl: input.serverUrl,
+      villageExternalId: input.villageExternalId,
+      dorf2Script: input.dorf2Script,
+      contextLabel: "Validar construccion posterior",
+    });
+
+    if (didConstructionStateChange(input.beforeSnapshot, afterSnapshot, input.targetSlot)) {
+      return;
+    }
+  }
+
+  throw new Error(
+    `Travian no confirmó el inicio de la construcción en el slot ${input.targetSlot}: ` +
+      "el edificio y la cola permanecieron sin cambios.",
+  );
+};
+
 export const executeApprovedProposal = async (proposalId: string) => {
   await ensureDatabase();
 
@@ -724,6 +874,14 @@ export const executeApprovedProposal = async (proposalId: string) => {
     await loginIfNeeded(page, credentials);
     await persistSessionState(context);
 
+    const dorf2Script = await loadDorf2Script();
+    const beforeSnapshot = await readVillageCenterSnapshot(page, {
+      serverUrl: credentials.serverUrl,
+      villageExternalId: proposal.village.externalId,
+      dorf2Script,
+      contextLabel: "Captura previa a construccion",
+    });
+
     await openUpgradeTarget(page, {
       kind: candidate.kind as "resourceField" | "building",
       slot: candidate.slot,
@@ -752,6 +910,15 @@ export const executeApprovedProposal = async (proposalId: string) => {
         );
       }
     }
+
+    await confirmBuildStarted(page, {
+      serverUrl: credentials.serverUrl,
+      villageExternalId: proposal.village.externalId,
+      dorf2Script,
+      targetSlot: candidate.slot,
+      beforeSnapshot,
+    });
+    await persistSessionState(context);
 
     await db.agentExecution.update({
       where: {

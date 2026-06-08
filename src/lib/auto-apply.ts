@@ -639,7 +639,7 @@ export const processAutoApplyJob = async (jobId: string) => {
 
     if (
       updated.attemptCount >= MAX_ATTEMPTS_BEFORE_PAUSE ||
-      /captcha|login|anti-bot/i.test(message)
+      /captcha|login|anti-bot|no confirmó el inicio de la construcción|Building slot \d+ was not found|Resource field slot \d+ was not found/i.test(message)
     ) {
       await pauseVillageAutoApply({
         villageId: job.villageId,
@@ -670,8 +670,11 @@ export const listVillageAutoApplyState = async (villageIds: string[]) => {
       villageId: {
         in: villageIds,
       },
+      // El dashboard solo debe mostrar jobs realmente activos.
+      // Las pausas históricas permanecen en SQLite para auditoría,
+      // pero no representan el próximo intento actual.
       status: {
-        in: ["pending", "running", "paused"],
+        in: ["pending", "running"],
       },
     },
     orderBy: {
@@ -704,7 +707,9 @@ export const processDueAutoApplyJobs = async () => {
     orderBy: {
       runAt: "asc",
     },
-    take: 10,
+    // Cada job puede realizar capturas Playwright costosas.
+    // Procesamos uno por ciclo para evitar tandas demasiado largas.
+    take: 1,
   });
 
   for (const job of dueJobs) {
