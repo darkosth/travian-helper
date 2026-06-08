@@ -405,6 +405,26 @@ const getStorageBlocker = (
   );
 };
 
+const hasCompletedAutomatedSecondVillageRoute = (
+  snapshot: VillageSnapshotLike,
+) =>
+  snapshot.buildings.some((building) => {
+    const normalizedName = normalizeText(building.name);
+
+    return (
+      (normalizedName.includes("residence") ||
+        normalizedName.includes("residencia")) &&
+      (building.level ?? 0) >= 10
+    );
+  });
+
+const isSecondVillageRushActive = (
+  snapshot: VillageSnapshotLike,
+  account: AccountStrategyContext,
+) =>
+  (account.usedVillageSlots ?? 1) < 2 &&
+  !hasCompletedAutomatedSecondVillageRoute(snapshot);
+
 const findStoragePrerequisiteCandidate = (
   blockedCandidate: RecommendationCandidate,
   candidates: RecommendationCandidate[],
@@ -883,7 +903,7 @@ export const scoreCandidate = (input: {
     account.cpNeededForNextSlot && account.cpNeededForNextSlot > 0
       ? (account.cpProducedForNextSlot ?? 0) / account.cpNeededForNextSlot
       : null;
-  const isSecondVillageRush = (account.usedVillageSlots ?? 1) < 2;
+  const isSecondVillageRush = isSecondVillageRushActive(snapshot, account);
   const isLowCrop = snapshot.freeCrop !== null && snapshot.freeCrop < 120;
   const isCropTight = snapshot.freeCrop !== null && snapshot.freeCrop < 250;
   const resourceFillPressure = Math.max(...resourceTypes.map((type) => getResourceFillRatio(resources[type])));
@@ -1064,8 +1084,9 @@ export const buildHeuristicCandidates = (input: {
       memory,
     }),
   );
-  const baseStrictRoute =
-    (account.usedVillageSlots ?? 1) < 2
+
+    const baseStrictRoute =
+    isSecondVillageRushActive(snapshot, account)
       ? getStrictRouteRecommendation({
           snapshot,
           account,
@@ -1075,14 +1096,25 @@ export const buildHeuristicCandidates = (input: {
         })
       : null;
 
-  // Durante el rush conservamos la ruta estricta como autoridad,
-  // pero insertamos Almacén o Granero si el siguiente hito no cabe físicamente.
-  const strictRoute = applyStoragePrerequisiteToStrictRoute(
-    baseStrictRoute,
-    scoredCandidates,
-    resources,
-  );
-
+      const storagePrerequisite =
+        baseStrictRoute?.candidate
+          ? findStoragePrerequisiteCandidate(
+              baseStrictRoute.candidate,
+              scoredCandidates,
+              resources,
+            )
+          : null;
+      // La ruta sigue apuntando a la Residencia, Academia, Ayuntamiento, etc.
+      // Pero si el costo no cabe físicamente, primero subimos el almacenamiento.
+      const strictRoute =
+        baseStrictRoute && storagePrerequisite
+          ? {
+              ...baseStrictRoute,
+              candidateId: storagePrerequisite.id,
+              candidate: storagePrerequisite,
+            }
+          : baseStrictRoute;
+          
   const candidates =
     strictRoute?.candidate && !scoredCandidates.some((candidate) => candidate.id === strictRoute.candidateId)
       ? [...scoredCandidates, strictRoute.candidate]
@@ -1245,27 +1277,12 @@ const getExpansionMilestoneOverride = (
 ): StrictRouteMilestone | null => {
   const townHallLevel = getBuildingLevel(snapshot, ["town hall", "ayuntamiento"]);
   const residenceLevel = getBuildingLevel(snapshot, ["residence", "residencia"]);
-  const cpProgress =
-    account.cpNeededForNextSlot && account.cpNeededForNextSlot > 0
-      ? (account.cpProducedForNextSlot ?? 0) / account.cpNeededForNextSlot
-      : null;
 
+  // Mientras falte Residence 10 seguimos la ruta automática.
+  // Después de alcanzarla, CP, celebraciones y colonos quedan fuera del bloqueo
+  // estricto: el recomendador vuelve al crecimiento general de población.
   if (townHallLevel >= 1 && residenceLevel < 10) {
     return secondVillageRoute.find((milestone) => milestone.id === "residence-10") ?? null;
-  }
-
-  if (townHallLevel >= 1 && residenceLevel >= 10 && cpProgress !== null && cpProgress < 1) {
-    return {
-      id: "party-until-cp-ready",
-      title: "Run celebrations until CP are ready",
-      summary: `Culture points are at ${Math.round(cpProgress * 100)}%, so keep celebrations ahead of settlers.`,
-      target: { kind: "manual" },
-      reasons: ["CP is still the bottleneck", "Town Hall is already available"],
-    };
-  }
-
-  if (residenceLevel >= 10 && (cpProgress === null || cpProgress >= 1)) {
-    return secondVillageRoute.find((milestone) => milestone.id === "settlers") ?? null;
   }
 
   return null;
@@ -1364,45 +1381,6 @@ const getStrictRouteRecommendation = (input: {
   };
 };
 
-const applyStoragePrerequisiteToStrictRoute = (
-  strictRoute: StrictRouteContext | null,
-  candidates: RecommendationCandidate[],
-  resources: Record<ResourceType, ResourceSnapshotLike>,
-): StrictRouteContext | null => {
-  if (!strictRoute?.candidate) {
-    return strictRoute;
-  }
-
-  const storagePrerequisite = findStoragePrerequisiteCandidate(
-    strictRoute.candidate,
-    candidates,
-    resources,
-  );
-
-  if (!storagePrerequisite) {
-    return strictRoute;
-  }
-
-  const waitTimeText = formatHoursToText(storagePrerequisite.timeToAffordHours);
-  const actionText = storagePrerequisite.affordableNow
-    ? `${storagePrerequisite.label} is available now.`
-    : `Wait ${waitTimeText ?? "until production catches up"} for ${storagePrerequisite.label}.`;
-
-  return {
-    ...strictRoute,
-    candidateId: storagePrerequisite.id,
-    candidate: storagePrerequisite,
-    title: storagePrerequisite.affordableNow
-      ? storagePrerequisite.label
-      : `Wait for ${storagePrerequisite.label}`,
-    summary: `${strictRoute.title} is blocked by storage capacity. ${actionText}`,
-    waitTimeText,
-    shouldWait: !storagePrerequisite.affordableNow,
-    reasons: [...strictRoute.reasons, ...storagePrerequisite.reasons],
-    score: Math.max(strictRoute.score, storagePrerequisite.score),
-  };
-};
-
 const applyStrictRoutePriority = (
   candidates: RecommendationCandidate[],
   strictRoute: StrictRouteContext | null,
@@ -1424,36 +1402,6 @@ const applyStrictRoutePriority = (
       };
     })
     .sort((left, right) => right.score - left.score);
-};
-
-type CandidateSelection = {
-  candidate: RecommendationCandidate;
-  shouldWait: boolean;
-};
-
-const applyStoragePrerequisiteToSelection = (
-  selection: CandidateSelection | null,
-  candidates: RecommendationCandidate[],
-  resources: Record<ResourceType, ResourceSnapshotLike>,
-): CandidateSelection | null => {
-  if (!selection) {
-    return null;
-  }
-
-  const storagePrerequisite = findStoragePrerequisiteCandidate(
-    selection.candidate,
-    candidates,
-    resources,
-  );
-
-  if (!storagePrerequisite) {
-    return selection;
-  }
-
-  return {
-    candidate: storagePrerequisite,
-    shouldWait: !storagePrerequisite.affordableNow,
-  };
 };
 
 export const getVillageRecommendation = (input: {
@@ -1500,22 +1448,14 @@ export const buildVillageDecision = (input: {
     };
   }
 
-  const { resources, memory, candidates, strictRoute } = buildHeuristicCandidates({
+  const { memory, candidates, strictRoute } = buildHeuristicCandidates({
     snapshot: effectiveSnapshot,
     history,
     account,
   });
   const rankedCandidates = applyStrictRoutePriority(candidates, strictRoute);
-  const baseSelected = chooseCandidate(rankedCandidates);
-
-  // Regla transversal: cualquier recomendación imposible por capacidad
-  // se sustituye temporalmente por Almacén o Granero, incluso fuera del rush.
-  const selected = applyStoragePrerequisiteToSelection(
-    baseSelected,
-    rankedCandidates,
-    resources,
-  );
-  const isSecondVillageRush = (account.usedVillageSlots ?? 1) < 2;
+  const selected = chooseCandidate(rankedCandidates);
+  const isSecondVillageRush = isSecondVillageRushActive(effectiveSnapshot, account);
   const focus = isSecondVillageRush
     ? "Second village rush"
     : "Population leaderboard growth";
