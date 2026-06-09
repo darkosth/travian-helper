@@ -64,9 +64,20 @@ export const listCredentialProfiles = async () => {
     label: profile.label,
     serverUrl: profile.serverUrl,
     username: profile.username,
+    accountId: profile.accountId,
     isActive: profile.isActive,
     updatedAt: profile.updatedAt,
   }));
+};
+
+export const getCredentialProfile = async (profileId: string) => {
+  await ensureDatabase();
+
+  return db.credentialProfile.findUnique({
+    where: {
+      id: profileId,
+    },
+  });
 };
 
 export const getActiveCredentialProfile = async () => {
@@ -92,24 +103,52 @@ export const getCredentialSummary = async () => {
   };
 };
 
-export const getActiveScopedAccount = async () => {
+export const getScopedAccount = async (profileId: string) => {
   await ensureDatabase();
 
-  const profile = await getActiveCredentialProfile();
+  const profile = await db.credentialProfile.findUnique({
+    where: {
+      id: profileId,
+    },
+    include: {
+      account: true,
+    },
+  });
 
   if (!profile) {
     return null;
   }
 
-  const latestRunForProfile = await db.captureRun.findFirst({
-    where: {
-      account: {
-        serverUrl: profile.serverUrl,
+  if (profile.account) {
+    const latestRun = await db.captureRun.findFirst({
+      where: {
+        credentialProfileId: profile.id,
+        accountId: profile.account.id,
+        status: {
+          in: ["complete", "partial"],
+        },
       },
+      orderBy: {
+        startedAt: "desc",
+      },
+    });
+
+    return {
+      profile,
+      account: profile.account,
+      latestRunId: latestRun?.id ?? null,
+    };
+  }
+
+  const latestRun = await db.captureRun.findFirst({
+    where: {
+      credentialProfileId: profile.id,
       accountId: {
         not: null,
       },
-      status: "complete",
+      status: {
+        in: ["complete", "partial"],
+      },
     },
     orderBy: {
       startedAt: "desc",
@@ -119,7 +158,7 @@ export const getActiveScopedAccount = async () => {
     },
   });
 
-  if (!latestRunForProfile?.account) {
+  if (!latestRun?.account) {
     return {
       profile,
       account: null,
@@ -127,15 +166,39 @@ export const getActiveScopedAccount = async () => {
     };
   }
 
+  const linkedProfile = await db.credentialProfile.update({
+    where: {
+      id: profile.id,
+    },
+    data: {
+      accountId: latestRun.account.id,
+    },
+    include: {
+      account: true,
+    },
+  });
+
   return {
-    profile,
-    account: latestRunForProfile.account,
-    latestRunId: latestRunForProfile.id,
+    profile: linkedProfile,
+    account: linkedProfile.account,
+    latestRunId: latestRun.id,
   };
 };
 
-export const getCredentialSecret = async () => {
+export const getActiveScopedAccount = async () => {
   const profile = await getActiveCredentialProfile();
+
+  if (!profile) {
+    return null;
+  }
+
+  return getScopedAccount(profile.id);
+};
+
+export const getCredentialSecret = async (profileId?: string) => {
+  const profile = profileId
+    ? await getCredentialProfile(profileId)
+    : await getActiveCredentialProfile();
 
   if (!profile) {
     return null;
@@ -143,10 +206,87 @@ export const getCredentialSecret = async () => {
 
   return {
     profileId: profile.id,
+    accountId: profile.accountId,
     serverUrl: profile.serverUrl,
     username: profile.username,
     password: decryptSecret(profile),
   };
+};
+
+export const getCredentialSecretForAccount = async (accountId: string) => {
+  await ensureDatabase();
+
+  const profile = await db.credentialProfile.findFirst({
+    where: {
+      accountId,
+    },
+    orderBy: {
+      updatedAt: "desc",
+    },
+  });
+
+  if (!profile) {
+    return null;
+  }
+
+  return {
+    profileId: profile.id,
+    accountId: profile.accountId,
+    serverUrl: profile.serverUrl,
+    username: profile.username,
+    password: decryptSecret(profile),
+  };
+};
+
+export const linkCredentialProfileToAccount = async (
+  profileId: string,
+  accountId: string,
+) => {
+  await ensureDatabase();
+
+  const profile = await db.credentialProfile.findUnique({
+    where: {
+      id: profileId,
+    },
+  });
+
+  if (!profile) {
+    throw new Error("Credential profile not found.");
+  }
+
+  if (profile.accountId && profile.accountId !== accountId) {
+    throw new Error(
+      `Credential profile ${profile.label} is already linked to a different Travian account.`,
+    );
+  }
+
+  const otherLinkedProfile = await db.credentialProfile.findFirst({
+    where: {
+      accountId,
+      id: {
+        not: profile.id,
+      },
+    },
+  });
+
+  if (otherLinkedProfile) {
+    throw new Error(
+      `Travian account is already linked to credential profile ${otherLinkedProfile.label}.`,
+    );
+  }
+
+  if (profile.accountId === accountId) {
+    return profile;
+  }
+
+  return db.credentialProfile.update({
+    where: {
+      id: profile.id,
+    },
+    data: {
+      accountId,
+    },
+  });
 };
 
 export const saveCredentialProfile = async (input: SaveCredentialProfileInput) => {
@@ -166,6 +306,9 @@ export const saveCredentialProfile = async (input: SaveCredentialProfileInput) =
     const label = await buildProfileLabel(input.username, input.serverUrl, existingProfile.id);
     const encrypted =
       input.password && input.password.length > 0 ? encryptSecret(input.password) : null;
+    const identityChanged =
+      existingProfile.serverUrl !== input.serverUrl ||
+      existingProfile.username !== input.username;
 
     const updatedProfile = await db.credentialProfile.update({
       where: {
@@ -175,12 +318,29 @@ export const saveCredentialProfile = async (input: SaveCredentialProfileInput) =
         label,
         serverUrl: input.serverUrl,
         username: input.username,
+        ...(identityChanged ? { accountId: null } : {}),
         ...(encrypted ?? {}),
       },
     });
 
-    if (updatedProfile.isActive) {
-      await clearSavedSessionState();
+    await clearSavedSessionState(updatedProfile.id);
+
+    if (identityChanged) {
+      await db.autoApplyJob.updateMany({
+        where: {
+          credentialProfileId: updatedProfile.id,
+          status: {
+            in: ["pending", "running", "paused"],
+          },
+        },
+        data: {
+          status: "cancelled",
+          lastError: "Credential profile identity changed. Generate a fresh scoped queue.",
+          completedAt: new Date(),
+          lockToken: null,
+          lockedAt: null,
+        },
+      });
     }
 
     return updatedProfile;
@@ -209,7 +369,7 @@ export const saveCredentialProfile = async (input: SaveCredentialProfileInput) =
     },
   });
 
-  await clearSavedSessionState();
+  await clearSavedSessionState(createdProfile.id);
 
   return createdProfile;
 };
@@ -246,5 +406,6 @@ export const activateCredentialProfile = async (profileId: string) => {
     }),
   ]);
 
-  await clearSavedSessionState();
+  // Cambiar qué perfil se ve en la interfaz no debe cerrar la sesión
+  // Playwright de otros workers. Cada perfil usa su propio storageState.
 };

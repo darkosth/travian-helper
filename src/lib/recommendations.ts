@@ -904,8 +904,8 @@ export const scoreCandidate = (input: {
       ? (account.cpProducedForNextSlot ?? 0) / account.cpNeededForNextSlot
       : null;
   const isSecondVillageRush = isSecondVillageRushActive(snapshot, account);
-  const isLowCrop = snapshot.freeCrop !== null && snapshot.freeCrop < 120;
-  const isCropTight = snapshot.freeCrop !== null && snapshot.freeCrop < 250;
+  const isLowCrop = snapshot.freeCrop !== null && snapshot.freeCrop < 50;
+  const isCropTight = snapshot.freeCrop !== null && snapshot.freeCrop < 110;
   const resourceFillPressure = Math.max(...resourceTypes.map((type) => getResourceFillRatio(resources[type])));
   const lowestProductionType = getLowestProductionType(resources);
 

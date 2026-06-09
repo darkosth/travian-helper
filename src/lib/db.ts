@@ -31,8 +31,10 @@ const bootstrapStatements = [
     "iv" TEXT NOT NULL,
     "authTag" TEXT NOT NULL,
     "isActive" BOOLEAN NOT NULL DEFAULT false,
+    "accountId" TEXT,
     "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    "updatedAt" DATETIME NOT NULL
+    "updatedAt" DATETIME NOT NULL,
+    FOREIGN KEY ("accountId") REFERENCES "Account"("id") ON DELETE SET NULL ON UPDATE CASCADE
   );`,
   `CREATE TABLE IF NOT EXISTS "Account" (
     "id" TEXT NOT NULL PRIMARY KEY,
@@ -46,7 +48,7 @@ const bootstrapStatements = [
   `CREATE UNIQUE INDEX IF NOT EXISTS "Account_serverUrl_playerName_key" ON "Account"("serverUrl", "playerName");`,
   `CREATE TABLE IF NOT EXISTS "Village" (
     "id" TEXT NOT NULL PRIMARY KEY,
-    "externalId" INTEGER NOT NULL UNIQUE,
+    "externalId" INTEGER NOT NULL,
     "accountId" TEXT NOT NULL,
     "name" TEXT NOT NULL,
     "x" INTEGER,
@@ -58,6 +60,7 @@ const bootstrapStatements = [
     "updatedAt" DATETIME NOT NULL,
     FOREIGN KEY ("accountId") REFERENCES "Account"("id") ON DELETE CASCADE ON UPDATE CASCADE
   );`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS "Village_accountId_externalId_key" ON "Village"("accountId", "externalId");`,
   `CREATE TABLE IF NOT EXISTS "CaptureRun" (
     "id" TEXT NOT NULL PRIMARY KEY,
     "status" TEXT NOT NULL,
@@ -65,7 +68,9 @@ const bootstrapStatements = [
     "completedAt" DATETIME,
     "errorMessage" TEXT,
     "accountId" TEXT,
-    FOREIGN KEY ("accountId") REFERENCES "Account"("id") ON DELETE SET NULL ON UPDATE CASCADE
+    "credentialProfileId" TEXT,
+    FOREIGN KEY ("accountId") REFERENCES "Account"("id") ON DELETE SET NULL ON UPDATE CASCADE,
+    FOREIGN KEY ("credentialProfileId") REFERENCES "CredentialProfile"("id") ON DELETE SET NULL ON UPDATE CASCADE
   );`,
   `CREATE TABLE IF NOT EXISTS "CaptureRunVillage" (
     "id" TEXT NOT NULL PRIMARY KEY,
@@ -187,6 +192,7 @@ const bootstrapStatements = [
   `CREATE TABLE IF NOT EXISTS "AutoApplyJob" (
     "id" TEXT NOT NULL PRIMARY KEY,
     "villageId" TEXT NOT NULL,
+    "credentialProfileId" TEXT,
     "status" TEXT NOT NULL,
     "runAt" DATETIME NOT NULL,
     "notBefore" DATETIME,
@@ -201,7 +207,8 @@ const bootstrapStatements = [
     "completedAt" DATETIME,
     "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "updatedAt" DATETIME NOT NULL,
-    FOREIGN KEY ("villageId") REFERENCES "Village"("id") ON DELETE CASCADE ON UPDATE CASCADE
+    FOREIGN KEY ("villageId") REFERENCES "Village"("id") ON DELETE CASCADE ON UPDATE CASCADE,
+    FOREIGN KEY ("credentialProfileId") REFERENCES "CredentialProfile"("id") ON DELETE SET NULL ON UPDATE CASCADE
   );`,
   `CREATE INDEX IF NOT EXISTS "AutoApplyJob_status_runAt_idx" ON "AutoApplyJob"("status", "runAt");`,
   `CREATE INDEX IF NOT EXISTS "AutoApplyJob_villageId_status_runAt_idx" ON "AutoApplyJob"("villageId", "status", "runAt");`,
@@ -302,6 +309,10 @@ const additiveBootstrapStatements = [
      SELECT 1 FROM "CredentialProfile" WHERE "isActive" = true
    );`,
   `CREATE UNIQUE INDEX IF NOT EXISTS "CredentialProfile_active_key" ON "CredentialProfile"("isActive") WHERE "isActive" = true;`,
+  `CREATE INDEX IF NOT EXISTS "CredentialProfile_accountId_idx" ON "CredentialProfile"("accountId");`,
+  `CREATE INDEX IF NOT EXISTS "CaptureRun_credentialProfileId_startedAt_idx" ON "CaptureRun"("credentialProfileId", "startedAt");`,
+  `CREATE INDEX IF NOT EXISTS "AutoApplyJob_credentialProfileId_status_runAt_idx" ON "AutoApplyJob"("credentialProfileId", "status", "runAt");`,
+  `CREATE INDEX IF NOT EXISTS "AutoApplyJob_credentialProfileId_villageId_status_runAt_idx" ON "AutoApplyJob"("credentialProfileId", "villageId", "status", "runAt");`,
 ];
 
 type SqliteTableColumn = {
@@ -334,6 +345,24 @@ export const ensureDatabase = async () => {
       if (!(await credentialProfileHasIsActiveColumn())) {
         await db.$executeRawUnsafe(
           `ALTER TABLE "CredentialProfile" ADD COLUMN "isActive" BOOLEAN NOT NULL DEFAULT false;`,
+        );
+      }
+
+      if (!(await tableHasColumn("CredentialProfile", "accountId"))) {
+        await db.$executeRawUnsafe(
+          `ALTER TABLE "CredentialProfile" ADD COLUMN "accountId" TEXT;`,
+        );
+      }
+
+      if (!(await tableHasColumn("CaptureRun", "credentialProfileId"))) {
+        await db.$executeRawUnsafe(
+          `ALTER TABLE "CaptureRun" ADD COLUMN "credentialProfileId" TEXT;`,
+        );
+      }
+
+      if (!(await tableHasColumn("AutoApplyJob", "credentialProfileId"))) {
+        await db.$executeRawUnsafe(
+          `ALTER TABLE "AutoApplyJob" ADD COLUMN "credentialProfileId" TEXT;`,
         );
       }
 

@@ -4,6 +4,7 @@ import {
   getEffectiveConstructionState,
   getSoonestQueueDelayMs,
 } from "@/lib/construction-state";
+import { getActiveCredentialProfile, getCredentialProfile } from "@/lib/credentials";
 import { db, ensureDatabase } from "@/lib/db";
 import { runManualCapture } from "@/lib/playwright-capture";
 import type { ActiveConstructionLike } from "@/lib/recommendations";
@@ -17,6 +18,36 @@ const QUEUE_FINISH_BUFFER_MS = 15 * 1000;
 const MAX_ATTEMPTS_BEFORE_PAUSE = 3;
 const ACTIVE_JOB_STATUSES = ["pending", "running"] as const;
 const STALE_RUNNING_JOB_MS = 2 * 60 * 1000;
+
+const resolveCredentialProfileId = async (profileId?: string) => {
+  if (profileId) {
+    return profileId;
+  }
+
+  const activeProfile = await getActiveCredentialProfile();
+
+  if (!activeProfile) {
+    throw new Error("Missing active credential profile.");
+  }
+
+  return activeProfile.id;
+};
+
+const getLinkedProfileAccountId = async (profileId: string) => {
+  const profile = await getCredentialProfile(profileId);
+
+  if (!profile) {
+    throw new Error("Credential profile not found.");
+  }
+
+  if (!profile.accountId) {
+    throw new Error(
+      "Credential profile is not linked to a Travian account yet. Run a capture for this profile first.",
+    );
+  }
+
+  return profile.accountId;
+};
 
 const parseConstructionQueueJson = (value: string | null): ActiveConstructionLike[] => {
   if (!value) {
@@ -54,10 +85,15 @@ const shouldAllowSafeSecondSlot = (input: {
   return Boolean(input.candidate?.affordableNow);
 };
 
-const markJobsCancelledForVillage = async (villageId: string, reason: string) => {
+const markJobsCancelledForVillage = async (
+  villageId: string,
+  reason: string,
+  profileId?: string,
+) => {
   await db.autoApplyJob.updateMany({
     where: {
       villageId,
+      ...(profileId ? { credentialProfileId: profileId } : {}),
       status: {
         in: [...ACTIVE_JOB_STATUSES],
       },
@@ -75,6 +111,7 @@ const markJobsCancelledForVillage = async (villageId: string, reason: string) =>
 export const pauseVillageAutoApply = async (input: {
   villageId: string;
   reason: string;
+  profileId?: string;
 }) => {
   await ensureDatabase();
 
@@ -91,6 +128,7 @@ export const pauseVillageAutoApply = async (input: {
   await db.autoApplyJob.updateMany({
     where: {
       villageId: input.villageId,
+      ...(input.profileId ? { credentialProfileId: input.profileId } : {}),
       status: {
         in: [...ACTIVE_JOB_STATUSES],
       },
@@ -117,11 +155,12 @@ const clearVillagePause = async (villageId: string) => {
   });
 };
 
-const recoverStaleRunningJobs = async () => {
+const recoverStaleRunningJobs = async (profileId: string) => {
   const staleBefore = new Date(Date.now() - STALE_RUNNING_JOB_MS);
 
   await db.autoApplyJob.updateMany({
     where: {
+      credentialProfileId: profileId,
       status: "running",
       OR: [
         {
@@ -146,6 +185,7 @@ const recoverStaleRunningJobs = async () => {
 };
 
 const scheduleVillageJob = async (input: {
+  credentialProfileId: string;
   villageId: string;
   runAt: Date;
   proposalId?: string | null;
@@ -154,6 +194,7 @@ const scheduleVillageJob = async (input: {
 }) => {
   const activeJobs = await db.autoApplyJob.findMany({
     where: {
+      credentialProfileId: input.credentialProfileId,
       villageId: input.villageId,
       status: {
         in: [...ACTIVE_JOB_STATUSES],
@@ -171,6 +212,7 @@ const scheduleVillageJob = async (input: {
   if (runningJob) {
     await db.autoApplyJob.updateMany({
       where: {
+        credentialProfileId: input.credentialProfileId,
         villageId: input.villageId,
         status: "pending",
       },
@@ -189,6 +231,7 @@ const scheduleVillageJob = async (input: {
   if (pendingJob) {
     await db.autoApplyJob.updateMany({
       where: {
+        credentialProfileId: input.credentialProfileId,
         villageId: input.villageId,
         status: "pending",
         id: {
@@ -219,6 +262,7 @@ const scheduleVillageJob = async (input: {
 
   return db.autoApplyJob.create({
     data: {
+      credentialProfileId: input.credentialProfileId,
       villageId: input.villageId,
       status: "pending",
       runAt: input.runAt,
@@ -284,12 +328,15 @@ const getCandidateDelayMs = (candidate: AutoApplyCandidateLike | null) => {
   return Math.max(MIN_RETRY_DELAY_MS, candidate.timeToAffordHours * 60 * 60 * 1000);
 };
 
-export const syncAutoApplyJobsFromLatestRun = async () => {
+export const syncAutoApplyJobsFromLatestRun = async (profileId?: string) => {
   await ensureDatabase();
-  await recoverStaleRunningJobs();
+  const resolvedProfileId = await resolveCredentialProfileId(profileId);
+  const accountId = await getLinkedProfileAccountId(resolvedProfileId);
+  await recoverStaleRunningJobs(resolvedProfileId);
 
   const villages = await db.village.findMany({
     where: {
+      accountId,
       autoApplyEnabled: true,
     },
     include: {
@@ -330,6 +377,7 @@ export const syncAutoApplyJobsFromLatestRun = async () => {
       await markJobsCancelledForVillage(
         village.id,
         !snapshot ? "Missing current village snapshot." : "Missing pending proposal.",
+        resolvedProfileId,
       );
       continue;
     }
@@ -338,6 +386,7 @@ export const syncAutoApplyJobsFromLatestRun = async () => {
       await pauseVillageAutoApply({
         villageId: village.id,
         reason: "Incoming attacks detected.",
+        profileId: resolvedProfileId,
       });
       continue;
     }
@@ -388,6 +437,7 @@ export const syncAutoApplyJobsFromLatestRun = async () => {
     }
 
     await scheduleVillageJob({
+      credentialProfileId: resolvedProfileId,
       villageId: village.id,
       runAt: addMilliseconds(new Date(), delayMs),
       proposalId: proposal.id,
@@ -397,13 +447,14 @@ export const syncAutoApplyJobsFromLatestRun = async () => {
   }
 };
 
-export const refreshAutoApplyState = async () => {
+export const refreshAutoApplyState = async (profileId?: string) => {
   await ensureDatabase();
-  await recoverStaleRunningJobs();
+  const resolvedProfileId = await resolveCredentialProfileId(profileId);
+  await recoverStaleRunningJobs(resolvedProfileId);
 
-  const captureRunId = await runManualCapture();
-  await generateAgentProposals();
-  await syncAutoApplyJobsFromLatestRun();
+  const captureRunId = await runManualCapture(resolvedProfileId);
+  await generateAgentProposals(resolvedProfileId);
+  await syncAutoApplyJobsFromLatestRun(resolvedProfileId);
 
   return captureRunId;
 };
@@ -411,8 +462,11 @@ export const refreshAutoApplyState = async () => {
 export const setVillageAutoApply = async (input: {
   villageId: string;
   enabled: boolean;
+  profileId?: string;
 }) => {
   await ensureDatabase();
+  const resolvedProfileId = await resolveCredentialProfileId(input.profileId);
+  const accountId = await getLinkedProfileAccountId(resolvedProfileId);
 
   const village = await db.village.findUnique({
     where: {
@@ -422,6 +476,10 @@ export const setVillageAutoApply = async (input: {
 
   if (!village) {
     throw new Error("Village not found.");
+  }
+
+  if (village.accountId !== accountId) {
+    throw new Error("Village does not belong to the selected credential profile.");
   }
 
   await db.village.update({
@@ -436,17 +494,18 @@ export const setVillageAutoApply = async (input: {
   });
 
   if (!input.enabled) {
-    await markJobsCancelledForVillage(input.villageId, "Auto-apply disabled.");
+    await markJobsCancelledForVillage(input.villageId, "Auto-apply disabled.", resolvedProfileId);
     return;
   }
 
   await clearVillagePause(input.villageId);
-  await syncAutoApplyJobsFromLatestRun();
+  await syncAutoApplyJobsFromLatestRun(resolvedProfileId);
 };
 
-const getNextPendingJob = async () =>
+const getNextPendingJob = async (profileId: string) =>
   db.autoApplyJob.findFirst({
     where: {
+      credentialProfileId: profileId,
       status: "pending",
     },
     orderBy: {
@@ -457,11 +516,12 @@ const getNextPendingJob = async () =>
     },
   });
 
-const claimJob = async (jobId: string) => {
+const claimJob = async (jobId: string, profileId: string) => {
   const lockToken = randomUUID();
   const updateResult = await db.autoApplyJob.updateMany({
     where: {
       id: jobId,
+      credentialProfileId: profileId,
       status: "pending",
     },
     data: {
@@ -502,10 +562,12 @@ const isDeterministicFailure = (message: string) =>
 const isStaleProposalFailure = (message: string) =>
   /The village changed after this proposal was generated|Regenerate it first/i.test(message);
 
-export const processAutoApplyJob = async (jobId: string) => {
+export const processAutoApplyJob = async (jobId: string, profileId?: string) => {
   await ensureDatabase();
+  const resolvedProfileId = await resolveCredentialProfileId(profileId);
+  const accountId = await getLinkedProfileAccountId(resolvedProfileId);
 
-  const lockToken = await claimJob(jobId);
+  const lockToken = await claimJob(jobId, resolvedProfileId);
 
   if (!lockToken) {
     return false;
@@ -522,6 +584,14 @@ export const processAutoApplyJob = async (jobId: string) => {
 
   if (!job) {
     return false;
+  }
+
+  if (
+    job.credentialProfileId !== resolvedProfileId ||
+    job.village.accountId !== accountId
+  ) {
+    await finishJob(job.id, "cancelled", "Job belongs to a different credential profile.");
+    return true;
   }
 
   try {
@@ -548,6 +618,7 @@ export const processAutoApplyJob = async (jobId: string) => {
       await pauseVillageAutoApply({
         villageId: latest.village.id,
         reason: "Incoming attacks detected.",
+        profileId: resolvedProfileId,
       });
       await finishJob(job.id, "paused", "Incoming attacks detected.");
       return true;
@@ -587,7 +658,7 @@ export const processAutoApplyJob = async (jobId: string) => {
       return true;
     }
 
-    await approveAgentProposal(proposal.id, selectedCandidate.id);
+    await approveAgentProposal(proposal.id, selectedCandidate.id, resolvedProfileId);
     await finishJob(job.id, "done");
 
     return true;
@@ -603,6 +674,7 @@ export const processAutoApplyJob = async (jobId: string) => {
       await pauseVillageAutoApply({
         villageId: job.villageId,
         reason: message,
+        profileId: resolvedProfileId,
       });
       await finishJob(job.id, "paused", message);
       return true;
@@ -640,6 +712,7 @@ export const processAutoApplyJob = async (jobId: string) => {
       await pauseVillageAutoApply({
         villageId: job.villageId,
         reason: message,
+        profileId: resolvedProfileId,
       });
       await finishJob(job.id, "paused", message);
     }
@@ -648,10 +721,11 @@ export const processAutoApplyJob = async (jobId: string) => {
   }
 };
 
-export const getAutoApplyWorkerWaitMs = async () => {
+export const getAutoApplyWorkerWaitMs = async (profileId?: string) => {
   await ensureDatabase();
-  await recoverStaleRunningJobs();
-  const nextJob = await getNextPendingJob();
+  const resolvedProfileId = await resolveCredentialProfileId(profileId);
+  await recoverStaleRunningJobs(resolvedProfileId);
+  const nextJob = await getNextPendingJob(resolvedProfileId);
 
   if (!nextJob) {
     return SAFETY_SWEEP_MS;
@@ -704,12 +778,14 @@ export const listVillageAutoApplyState = async (villageIds: string[]) => {
   return activeByVillage;
 };
 
-export const processDueAutoApplyJobs = async () => {
+export const processDueAutoApplyJobs = async (profileId?: string) => {
   await ensureDatabase();
-  await recoverStaleRunningJobs();
+  const resolvedProfileId = await resolveCredentialProfileId(profileId);
+  await recoverStaleRunningJobs(resolvedProfileId);
 
   const dueJob = await db.autoApplyJob.findFirst({
     where: {
+      credentialProfileId: resolvedProfileId,
       status: "pending",
       runAt: {
         lte: new Date(),
@@ -724,6 +800,6 @@ export const processDueAutoApplyJobs = async () => {
     return 0;
   }
 
-  await processAutoApplyJob(dueJob.id);
+  await processAutoApplyJob(dueJob.id, resolvedProfileId);
   return 1;
 };

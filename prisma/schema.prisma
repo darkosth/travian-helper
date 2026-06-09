@@ -21,8 +21,14 @@ model CredentialProfile {
   iv                String
   authTag           String
   isActive          Boolean  @default(false)
+  accountId         String?
   createdAt         DateTime @default(now())
   updatedAt         DateTime @updatedAt
+  account           Account? @relation(fields: [accountId], references: [id], onDelete: SetNull)
+  captureRuns       CaptureRun[]
+  autoApplyJobs     AutoApplyJob[]
+
+  @@index([accountId])
 }
 
 model Account {
@@ -36,13 +42,14 @@ model Account {
   villages        Village[]
   captureRuns     CaptureRun[]
   accountSnapshots AccountSnapshot[]
+  credentialProfiles CredentialProfile[]
 
   @@unique([serverUrl, playerName])
 }
 
 model Village {
   id          String            @id @default(cuid())
-  externalId  Int               @unique
+  externalId  Int
   accountId   String
   name        String
   x           Int?
@@ -57,6 +64,8 @@ model Village {
   captureRuns CaptureRunVillage[]
   proposals   AgentProposal[]
   autoApplyJobs AutoApplyJob[]
+
+  @@unique([accountId, externalId])
 }
 
 model CaptureRun {
@@ -66,11 +75,15 @@ model CaptureRun {
   completedAt     DateTime?
   errorMessage    String?
   accountId       String?
+  credentialProfileId String?
   account         Account?            @relation(fields: [accountId], references: [id], onDelete: SetNull)
+  credentialProfile CredentialProfile? @relation(fields: [credentialProfileId], references: [id], onDelete: SetNull)
   villageRuns     CaptureRunVillage[]
   accountSnapshots AccountSnapshot[]
   villageSnapshots VillageSnapshot[]
   rawPayloads     RawSnapshotPayload[]
+
+  @@index([credentialProfileId, startedAt])
 }
 
 model CaptureRunVillage {
@@ -302,6 +315,7 @@ model RawSnapshotPayload {
 model AutoApplyJob {
   id                String   @id @default(cuid())
   villageId         String
+  credentialProfileId String?
   status            String
   runAt             DateTime
   notBefore         DateTime?
@@ -317,7 +331,10 @@ model AutoApplyJob {
   createdAt         DateTime @default(now())
   updatedAt         DateTime @updatedAt
   village           Village  @relation(fields: [villageId], references: [id], onDelete: Cascade)
+  credentialProfile CredentialProfile? @relation(fields: [credentialProfileId], references: [id], onDelete: SetNull)
 
   @@index([status, runAt])
   @@index([villageId, status, runAt])
+  @@index([credentialProfileId, status, runAt])
+  @@index([credentialProfileId, villageId, status, runAt])
 }

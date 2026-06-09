@@ -88,9 +88,9 @@ export const buildContextKey = (input: {
     ),
   );
   const cropState =
-    snapshot.freeCrop !== null && snapshot.freeCrop < 120
+    snapshot.freeCrop !== null && snapshot.freeCrop < 50
       ? "crop_critical"
-      : snapshot.freeCrop !== null && snapshot.freeCrop < 250
+      : snapshot.freeCrop !== null && snapshot.freeCrop < 110
         ? "crop_tight"
         : "crop_stable";
   const phase = (account.usedVillageSlots ?? 1) < 2 ? "early" : "established";
@@ -288,9 +288,9 @@ export const evaluateProposalOutcome = (input: {
         : -1.4
       : 0;
   const cropFit =
-    afterSnapshot.freeCrop !== null && afterSnapshot.freeCrop < 120
+    afterSnapshot.freeCrop !== null && afterSnapshot.freeCrop < 50
       ? -2.4
-      : beforeSnapshot.freeCrop !== null && beforeSnapshot.freeCrop < 120 && freeCropDelta > 0
+      : beforeSnapshot.freeCrop !== null && beforeSnapshot.freeCrop < 50 && freeCropDelta > 0
         ? 1.8
         : 0;
 

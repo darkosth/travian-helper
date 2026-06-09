@@ -1,5 +1,5 @@
 import { db, ensureDatabase } from "@/lib/db";
-import { getActiveScopedAccount } from "@/lib/credentials";
+import { getActiveScopedAccount, getScopedAccount } from "@/lib/credentials";
 import { executeApprovedProposal } from "@/lib/playwright-capture";
 import { attachBuildMenuSlotsToSnapshot, parseDorf2BuildMenuPayload } from "@/lib/build-options";
 import {
@@ -271,8 +271,10 @@ const serializeCandidate = (candidate: LearningAwareCandidate) => ({
   reasonsJson: stableJson(candidate.reasons),
 });
 
-const getLatestRunState = async () => {
-  const scopedAccount = await getActiveScopedAccount();
+const getLatestRunState = async (profileId?: string) => {
+  const scopedAccount = profileId
+    ? await getScopedAccount(profileId)
+    : await getActiveScopedAccount();
 
   if (!scopedAccount?.account?.id) {
     return null;
@@ -281,6 +283,7 @@ const getLatestRunState = async () => {
   const latestRun = await db.captureRun.findFirst({
     where: {
       accountId: scopedAccount.account.id,
+      ...(profileId ? { credentialProfileId: profileId } : {}),
     },
     orderBy: {
       startedAt: "desc",
@@ -308,10 +311,10 @@ const getLatestRunState = async () => {
   return latestRun;
 };
 
-export const generateAgentProposals = async () => {
+export const generateAgentProposals = async (profileId?: string) => {
   await ensureDatabase();
 
-  const latestRun = await getLatestRunState();
+  const latestRun = await getLatestRunState(profileId);
 
   if (!latestRun?.accountId || latestRun.villageSnapshots.length === 0) {
     return [];
@@ -532,7 +535,11 @@ export const rejectAgentProposal = async (proposalId: string) => {
   });
 };
 
-export const approveAgentProposal = async (proposalId: string, candidateId: string) => {
+export const approveAgentProposal = async (
+  proposalId: string,
+  candidateId: string,
+  profileId?: string,
+) => {
   await ensureDatabase();
 
   const proposal = await db.agentProposal.findUnique({
@@ -603,7 +610,7 @@ export const approveAgentProposal = async (proposalId: string, candidateId: stri
     },
   });
 
-  return executeApprovedProposal(proposal.id);
+  return executeApprovedProposal(proposal.id, profileId);
 };
 
 const outcomeSummary = (outcome: {

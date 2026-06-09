@@ -1,6 +1,10 @@
 import { chromium, type Browser, type Page } from "playwright";
 import { db, ensureDatabase } from "@/lib/db";
-import { getCredentialSecret } from "@/lib/credentials";
+import {
+  getCredentialSecret,
+  getCredentialSecretForAccount,
+  linkCredentialProfileToAccount,
+} from "@/lib/credentials";
 import {
   clearSavedSessionState,
   hasSavedSessionState,
@@ -25,17 +29,17 @@ const villageHopDelayMs = 350;
 const waitForGentlePacing = (page: Page, timeoutMs = villageHopDelayMs) =>
   page.waitForTimeout(timeoutMs);
 
-const createCaptureContext = async (browser: Browser) => {
-  if (!(await hasSavedSessionState())) {
+const createCaptureContext = async (browser: Browser, profileId: string) => {
+  if (!(await hasSavedSessionState(profileId))) {
     return browser.newContext();
   }
 
   try {
     return await browser.newContext({
-      storageState: getSessionStatePath(),
+      storageState: getSessionStatePath(profileId),
     });
   } catch {
-    await clearSavedSessionState();
+    await clearSavedSessionState(profileId);
     return browser.newContext();
   }
 };
@@ -540,9 +544,9 @@ const assertSnapshotHasCurrentVillage = async (
   throw parsed.error;
 };
 
-export const runManualCapture = async () => {
+export const runManualCapture = async (profileId?: string) => {
   await ensureDatabase();
-  const credentials = await getCredentialSecret();
+  const credentials = await getCredentialSecret(profileId);
 
   if (!credentials) {
     throw new Error("Missing saved credentials.");
@@ -551,6 +555,7 @@ export const runManualCapture = async () => {
   const captureRun = await db.captureRun.create({
     data: {
       status: "running",
+      credentialProfileId: credentials.profileId,
     },
   });
 
@@ -559,7 +564,7 @@ export const runManualCapture = async () => {
   });
 
   try {
-    const context = await createCaptureContext(browser);
+    const context = await createCaptureContext(browser, credentials.profileId);
     const page = await context.newPage();
     const dorf1Script = await loadDorf1Script();
     const dorf2Script = await loadDorf2Script();
@@ -568,7 +573,7 @@ export const runManualCapture = async () => {
     await gotoTravianPage(page, credentials.serverUrl);
 
     await loginIfNeeded(page, credentials);
-    await persistSessionState(context);
+    await persistSessionState(context, credentials.profileId);
 
     await gotoTravianPage(page, dorf1Url(credentials.serverUrl));
     await assertVillagePageLoaded(page, "Primer barrido");
@@ -662,6 +667,8 @@ export const runManualCapture = async () => {
           dorf1Payload,
           dorf2Payload,
         });
+
+        await linkCredentialProfileToAccount(credentials.profileId, result.accountId);
 
         await db.captureRun.update({
           where: {
@@ -813,7 +820,10 @@ const confirmBuildStarted = async (
   );
 };
 
-export const executeApprovedProposal = async (proposalId: string) => {
+export const executeApprovedProposal = async (
+  proposalId: string,
+  profileId?: string,
+) => {
   await ensureDatabase();
 
   const proposal = await db.agentProposal.findUnique({
@@ -856,7 +866,9 @@ export const executeApprovedProposal = async (proposalId: string) => {
     throw new Error("Only immediately affordable proposals can be applied.");
   }
 
-  const credentials = await getCredentialSecret();
+  const credentials = profileId
+    ? await getCredentialSecret(profileId)
+    : await getCredentialSecretForAccount(proposal.village.accountId);
   let candidateFeatures:
     | {
         buildAction?: "upgrade" | "construct";
@@ -879,7 +891,13 @@ export const executeApprovedProposal = async (proposalId: string) => {
   }
 
   if (!credentials) {
-    throw new Error("Missing saved credentials.");
+    throw new Error("Missing saved credentials for the proposal account.");
+  }
+
+  if (!credentials.accountId || credentials.accountId !== proposal.village.accountId) {
+    throw new Error(
+      "Credential profile is not linked to the Travian account that owns this proposal.",
+    );
   }
 
   const execution =
@@ -897,12 +915,12 @@ export const executeApprovedProposal = async (proposalId: string) => {
   });
 
   try {
-    const context = await createCaptureContext(browser);
+    const context = await createCaptureContext(browser, credentials.profileId);
     const page = await context.newPage();
 
     await gotoTravianPage(page, credentials.serverUrl);
     await loginIfNeeded(page, credentials);
-    await persistSessionState(context);
+    await persistSessionState(context, credentials.profileId);
 
     const dorf2Script = await loadDorf2Script();
     const beforeSnapshot = await readVillageCenterSnapshot(page, {
@@ -948,7 +966,7 @@ export const executeApprovedProposal = async (proposalId: string) => {
       targetSlot: candidate.slot,
       beforeSnapshot,
     });
-    await persistSessionState(context);
+    await persistSessionState(context, credentials.profileId);
 
     await db.agentExecution.update({
       where: {

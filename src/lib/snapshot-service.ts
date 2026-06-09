@@ -140,7 +140,10 @@ const ensureVillages = async (accountId: string, villages: Array<Record<string, 
 
     await db.village.upsert({
       where: {
-        externalId,
+        accountId_externalId: {
+          accountId,
+          externalId,
+        },
       },
       update: {
         accountId,
@@ -174,7 +177,10 @@ const ensureVillage = async (input: {
 }) =>
   db.village.upsert({
     where: {
-      externalId: input.externalId,
+      accountId_externalId: {
+        accountId: input.accountId,
+        externalId: input.externalId,
+      },
     },
     update: {
       accountId: input.accountId,
