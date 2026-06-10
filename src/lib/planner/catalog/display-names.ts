@@ -1,0 +1,57 @@
+/**
+ * Nombres legibles para mostrar el catálogo en la interfaz.
+ * El gid continúa siendo el identificador interno estable utilizado por Travian
+ * y por el simulador. Cambiar estos textos no altera la lógica del planner.
+ */
+const spanishCatalogNames: Record<number, string> = {
+  1: "Leñador",
+  2: "Barrera",
+  3: "Mina de hierro",
+  4: "Granja",
+  5: "Aserradero",
+  6: "Ladrillar",
+  7: "Fundición de hierro",
+  8: "Molino de cereales",
+  9: "Panadería",
+  10: "Almacén",
+  11: "Granero",
+  12: "Herrería",
+  13: "Armería (legacy)",
+  14: "Plaza de torneos",
+  15: "Edificio principal",
+  16: "Plaza de reuniones",
+  17: "Mercado",
+  18: "Embajada",
+  19: "Cuartel",
+  20: "Establo",
+  21: "Taller",
+  22: "Academia",
+  23: "Escondite",
+  24: "Ayuntamiento",
+  25: "Residencia",
+  26: "Palacio",
+  27: "Tesoro",
+  28: "Oficina de comercio",
+  29: "Gran cuartel",
+  30: "Gran establo",
+  31: "Muralla de la ciudad",
+  32: "Terraplén",
+  33: "Empalizada",
+  34: "Cantero",
+  35: "Cervecería",
+  36: "Trampero",
+  37: "Hogar del héroe",
+  38: "Gran almacén",
+  39: "Gran granero",
+  40: "Maravilla del mundo",
+  41: "Abrevadero",
+  42: "Muro de piedra",
+  43: "Muro improvisado",
+  44: "Centro de mando",
+  45: "Obras hidráulicas",
+  46: "Hospital",
+  47: "Gran taller",
+};
+
+export const getCatalogDisplayName = (gid: number, fallback?: string) =>
+  spanishCatalogNames[gid] ?? fallback ?? `gid ${gid}`;

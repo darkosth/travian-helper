@@ -1,3 +1,4 @@
+import { PlannerVillageAccess } from "@/components/planner-village-access";
 import { VillageDashboard } from "@/components/village-dashboard";
 import { getDashboardData } from "@/lib/dashboard";
 
@@ -8,6 +9,13 @@ export default async function VillagesPage() {
 
   return (
     <main className="flex flex-1 flex-col">
+      <PlannerVillageAccess
+        villages={dashboard.villages.map((village) => ({
+          dbId: village.dbId,
+          name: village.name,
+          coordinates: village.coordinates,
+        }))}
+      />
       <VillageDashboard villages={dashboard.villages} />
     </main>
   );

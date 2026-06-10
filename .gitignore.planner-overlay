@@ -1,0 +1,3 @@
+# Este archivo es informativo. Agrega estas líneas al .gitignore del repo si no existen.
+backups/
+.planner-test-build/

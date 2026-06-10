@@ -7,6 +7,7 @@ import {
 import { getActiveCredentialProfile, getCredentialProfile } from "@/lib/credentials";
 import { db, ensureDatabase } from "@/lib/db";
 import { runManualCapture } from "@/lib/playwright-capture";
+import { syncPlannerAgentProposals } from "@/lib/planner/proposal-bridge";
 import type { ActiveConstructionLike } from "@/lib/recommendations";
 
 // El MVP prioriza un flujo fácil de observar:
@@ -333,6 +334,7 @@ export const syncAutoApplyJobsFromLatestRun = async (profileId?: string) => {
   const resolvedProfileId = await resolveCredentialProfileId(profileId);
   const accountId = await getLinkedProfileAccountId(resolvedProfileId);
   await recoverStaleRunningJobs(resolvedProfileId);
+  await syncPlannerAgentProposals(resolvedProfileId);
 
   const villages = await db.village.findMany({
     where: {
@@ -454,6 +456,7 @@ export const refreshAutoApplyState = async (profileId?: string) => {
 
   const captureRunId = await runManualCapture(resolvedProfileId);
   await generateAgentProposals(resolvedProfileId);
+  await syncPlannerAgentProposals(resolvedProfileId);
   await syncAutoApplyJobsFromLatestRun(resolvedProfileId);
 
   return captureRunId;

@@ -1,0 +1,19 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "CommonJS",
+    "moduleResolution": "Node",
+    "strict": true,
+    "skipLibCheck": true,
+    "baseUrl": ".",
+    "paths": { "@/*": ["src/*"] },
+    "lib": ["ES2022", "DOM"],
+    "outDir": ".planner-test-build",
+    "esModuleInterop": true
+  },
+  "include": [
+    "src/lib/planner/catalog/**/*.ts",
+    "src/lib/planner/simulator/**/*.ts",
+    "scripts/planner-smoke-test.ts"
+  ]
+}

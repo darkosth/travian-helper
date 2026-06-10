@@ -48,3 +48,15 @@ next-env.d.ts
 *.bak*.ts
 *.backup.ts
 backups/
+.planner-test-build/
+
+# Base de datos SQLite local
+/dev.db
+/dev.db-wal
+/dev.db-shm
+/prisma/dev.db
+/prisma/dev.db-wal
+/prisma/dev.db-shm
+
+# Respaldos locales
+*.db.backup*

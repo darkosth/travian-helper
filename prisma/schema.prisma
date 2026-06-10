@@ -57,6 +57,7 @@ model Village {
   autoApplyEnabled Boolean      @default(false)
   autoApplyPausedAt DateTime?
   autoApplyPauseReason String?
+  plannerMode          String            @default("off")
   createdAt   DateTime          @default(now())
   updatedAt   DateTime          @updatedAt
   account     Account           @relation(fields: [accountId], references: [id], onDelete: Cascade)
@@ -64,6 +65,7 @@ model Village {
   captureRuns CaptureRunVillage[]
   proposals   AgentProposal[]
   autoApplyJobs AutoApplyJob[]
+  plans         VillagePlan[]
 
   @@unique([accountId, externalId])
 }
@@ -324,6 +326,7 @@ model AutoApplyJob {
   lastError         String?
   proposalId        String?
   captureRunId      String?
+  planStepId        String?
   lockToken         String?
   lockedAt          DateTime?
   processedAt       DateTime?
@@ -332,9 +335,95 @@ model AutoApplyJob {
   updatedAt         DateTime @updatedAt
   village           Village  @relation(fields: [villageId], references: [id], onDelete: Cascade)
   credentialProfile CredentialProfile? @relation(fields: [credentialProfileId], references: [id], onDelete: SetNull)
+  planStep          VillagePlanStep? @relation(fields: [planStepId], references: [id], onDelete: SetNull)
 
   @@index([status, runAt])
   @@index([villageId, status, runAt])
   @@index([credentialProfileId, status, runAt])
   @@index([credentialProfileId, villageId, status, runAt])
+  @@index([planStepId])
+}
+
+
+model VillagePlanTemplate {
+  id          String   @id @default(cuid())
+  name        String
+  tribeId     Int?
+  serverSpeed Int      @default(1)
+  description String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  revisions   VillagePlanTemplateRevision[]
+}
+
+model VillagePlanTemplateRevision {
+  id          String   @id @default(cuid())
+  templateId  String
+  revision    Int
+  status      String   // draft | published
+  stage       Int
+  summaryJson String?
+  createdAt   DateTime @default(now())
+  template    VillagePlanTemplate @relation(fields: [templateId], references: [id], onDelete: Cascade)
+  steps       VillagePlanTemplateStep[]
+  villagePlans VillagePlan[]
+
+  @@unique([templateId, revision])
+  @@index([templateId, status])
+}
+
+model VillagePlanTemplateStep {
+  id          String @id @default(cuid())
+  revisionId  String
+  position    Int
+  stage       Int
+  kind        String
+  action      String
+  slot        Int
+  gid         Int
+  targetLevel Int
+  revision    VillagePlanTemplateRevision @relation(fields: [revisionId], references: [id], onDelete: Cascade)
+
+  @@unique([revisionId, position])
+}
+
+model VillagePlan {
+  id                 String   @id @default(cuid())
+  villageId          String
+  templateRevisionId String?
+  revision           Int
+  status             String   // active | blocked | completed | archived
+  stage              Int
+  basedOnSnapshotId  String?
+  blockedReason      String?
+  originalEtaSeconds Int?
+  recalculatedEtaSeconds Int?
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+  village            Village @relation(fields: [villageId], references: [id], onDelete: Cascade)
+  templateRevision   VillagePlanTemplateRevision? @relation(fields: [templateRevisionId], references: [id], onDelete: SetNull)
+  steps              VillagePlanStep[]
+
+  @@index([villageId, status])
+}
+
+model VillagePlanStep {
+  id           String @id @default(cuid())
+  planId       String
+  position     Int
+  stage        Int
+  kind         String
+  action       String
+  slot         Int
+  gid          Int
+  targetLevel  Int
+  status       String // pending | waiting-resources | queued | building | completed | skipped | blocked
+  startedAt    DateTime?
+  completedAt  DateTime?
+  metadataJson String?
+  plan         VillagePlan @relation(fields: [planId], references: [id], onDelete: Cascade)
+  autoApplyJobs AutoApplyJob[]
+
+  @@unique([planId, position])
+  @@index([planId, status, position])
 }
