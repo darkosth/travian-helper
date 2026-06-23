@@ -1,6 +1,7 @@
 import { db } from "@/lib/db";
 import { getCatalogLevel } from "@/lib/planner/catalog";
 import { ensurePlannerDatabase } from "@/lib/planner/database";
+import { getPlannerStepSnapshotActionability } from "@/lib/planner/resolve-next-step";
 import { resolvePlannerWorkerDirective } from "@/lib/planner/worker-directive";
 
 const getPlanStep = async (stepId: string) =>
@@ -53,13 +54,23 @@ export const ensurePlannerAgentProposalForVillage = async (villageId: string) =>
 
   const step = await getPlanStep(directive.stepId);
   const snapshot = await db.villageSnapshot.findFirst({
-    where: { villageId },
-    orderBy: { scrapedAt: "desc" },
+    where: { id: directive.snapshotId, villageId },
+    include: { resources: true, resourceFields: true, buildings: true },
   });
   if (!step || !snapshot) return null;
 
   const catalogLevel = getCatalogLevel(step.gid, step.targetLevel);
   if (!catalogLevel) return null;
+  const snapshotActionability = getPlannerStepSnapshotActionability(snapshot, {
+    id: step.id,
+    position: step.position,
+    stage: step.stage as 1 | 2 | 3,
+    kind: step.kind as "resourceField" | "building",
+    action: step.action as "upgrade" | "construct",
+    slot: step.slot,
+    gid: step.gid,
+    targetLevel: step.targetLevel,
+  });
   const timing = getCandidateTiming(directive);
   const totalCost = Object.values(catalogLevel.cost).reduce((sum, amount) => sum + amount, 0);
   const fingerprint = `planner:${step.id}:${snapshot.id}`;
@@ -101,7 +112,7 @@ export const ensurePlannerAgentProposalForVillage = async (villageId: string) =>
           slot: step.slot,
           level: step.targetLevel,
           category: "planner",
-          affordableNow: timing.affordableNow,
+          affordableNow: timing.affordableNow && snapshotActionability.isActionableNow,
           totalCost,
           timeToAffordHours: timing.timeToAffordHours,
           heuristicScore: 0,
@@ -111,9 +122,11 @@ export const ensurePlannerAgentProposalForVillage = async (villageId: string) =>
           featuresJson: JSON.stringify({
             planner: true,
             planStepId: step.id,
+            snapshotId: snapshot.id,
             buildAction: step.action,
             targetGid: step.gid,
             targetHref: null,
+            actionabilityReason: snapshotActionability.blockedReason,
           }),
           reasonsJson: JSON.stringify([
             "Selected by frozen deterministic village plan.",

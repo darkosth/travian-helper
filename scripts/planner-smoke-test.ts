@@ -1,4 +1,5 @@
 import { accrueResources, simulateStep, validateStep, type PlannerStep, type SimulationState } from "../src/lib/planner/simulator";
+import { applyProjectedStepCompletion, isStepWaitingOnProjectedState } from "../src/lib/planner/resolve-next-step";
 
 const assert = (condition: unknown, message: string) => {
   if (!condition) throw new Error(message);
@@ -74,6 +75,25 @@ assert(skipped.result.status === "skipped", "La fila satisfecha manualmente debe
 // 7. El worker no salta niveles para improvisar una solución.
 const invalidJump = validateStep(createState(), field02);
 assert(invalidJump.status === "invalid-level", "El planner no debe aceptar saltos de nivel implícitos.");
+
+// 7b. Si el 0 → 1 ya está en cola, el siguiente 1 → 2 debe validarse sobre el
+// estado proyectado, no contra el snapshot viejo.
+const projectedQueuedField = applyProjectedStepCompletion(createState(), field01);
+const queuedFollowUp = validateStep(projectedQueuedField, field02);
+assert(queuedFollowUp.valid, "Un upgrade consecutivo debe volverse válido si el paso previo ya quedó en cola.");
+
+// 7c. Si el snapshot real sigue atrás pero el estado proyectado ya avanzó por
+// una obra en cola del mismo slot, el planner debe esperar construcción.
+const barracks12 = step({ id: "barracks-1-2", kind: "building", action: "upgrade", slot: 38, gid: 19, targetLevel: 2 });
+const barracks23 = step({ id: "barracks-2-3", kind: "building", action: "upgrade", slot: 38, gid: 19, targetLevel: 3 });
+const rawBarracksState = createState({
+  buildings: { 19: { gid: 15, level: 5 }, 38: { gid: 19, level: 1 } },
+});
+const projectedBarracksState = applyProjectedStepCompletion(rawBarracksState, barracks12);
+assert(
+  isStepWaitingOnProjectedState(rawBarracksState, projectedBarracksState, barracks23),
+  "El planner debe esperar a que termine la obra previa del mismo slot antes de intentar el siguiente nivel.",
+);
 
 // 8. Construir el primer almacén reemplaza el tope base, no lo duplica.
 const firstWarehouse = simulateStep(

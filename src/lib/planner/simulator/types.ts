@@ -58,6 +58,7 @@ export type SimulatedStep = {
   status: SimulatedStepStatus;
   waitForResourcesSeconds: number;
   buildDurationSeconds: number;
+  missingResources: ResourceAmounts;
   startsAtSeconds: number;
   finishesAtSeconds: number;
   resourcesBefore: ResourceAmounts;

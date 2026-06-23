@@ -16,22 +16,22 @@ export type ResourceFieldSlotDefinition = {
 export const STANDARD_4446_RESOURCE_FIELD_LAYOUT: ResourceFieldSlotDefinition[] = [
   { slot: 1, gid: 1 }, // Leñador
   { slot: 2, gid: 4 }, // Granja
-  { slot: 3, gid: 3 }, // Mina de hierro
-  { slot: 4, gid: 4 }, // Granja
+  { slot: 3, gid: 1 }, // leñador
+  { slot: 4, gid: 3 }, // mina de hierro
   { slot: 5, gid: 2 }, // Barrera
   { slot: 6, gid: 2 }, // Barrera
   { slot: 7, gid: 3 }, // Mina de hierro
   { slot: 8, gid: 4 }, // Granja
   { slot: 9, gid: 4 }, // Granja
   { slot: 10, gid: 3 }, // Mina de hierro
-  { slot: 11, gid: 1 }, // Leñador
+  { slot: 11, gid: 3 }, // Mina de hierro
   { slot: 12, gid: 4 }, // Granja
-  { slot: 13, gid: 1 }, // Leñador
-  { slot: 14, gid: 2 }, // Barrera
+  { slot: 13, gid: 4 }, // Granja
+  { slot: 14, gid: 1 }, // Leñador
   { slot: 15, gid: 4 }, // Granja
-  { slot: 16, gid: 1 }, // Leñador
-  { slot: 17, gid: 2 }, // Barrera
-  { slot: 18, gid: 3 }, // Mina de hierro
+  { slot: 16, gid: 2 }, // Barrera
+  { slot: 17, gid: 1 }, // leñador
+  { slot: 18, gid: 2 }, // Barrera
 ];
 
 export const getResourceFieldSelectionValue = (

@@ -1,5 +1,11 @@
 import { NextResponse } from "next/server";
-import { simulatePlan, type PlannerStep, type SimulationState } from "@/lib/planner/simulator";
+
+import { getResolvedInitialSimulationState } from "@/lib/planner/initial-state-profile-service";
+import {
+  simulatePlan,
+  type PlannerStep,
+  type SimulationState,
+} from "@/lib/planner/simulator";
 
 type SimulationRequest = {
   initialState?: SimulationState;
@@ -10,23 +16,34 @@ type SimulationRequest = {
 export const POST = async (request: Request) => {
   try {
     const body = (await request.json()) as SimulationRequest;
-    if (!body.initialState || !Array.isArray(body.steps)) {
+
+    if (!Array.isArray(body.steps)) {
       return NextResponse.json(
-        { error: "initialState y steps son obligatorios." },
+        { error: "steps es obligatorio." },
         { status: 400 },
       );
     }
 
+    const serverSpeed = body.serverSpeed ?? 1;
+    const initialState =
+      body.initialState ??
+      (await getResolvedInitialSimulationState(serverSpeed));
+
     return NextResponse.json(
       simulatePlan({
-        initialState: body.initialState,
+        initialState,
         steps: body.steps,
-        serverSpeed: body.serverSpeed ?? 1,
+        serverSpeed,
       }),
     );
   } catch (error) {
     return NextResponse.json(
-      { error: error instanceof Error ? error.message : "No se pudo simular la ruta." },
+      {
+        error:
+          error instanceof Error
+            ? error.message
+            : "No se pudo simular la ruta.",
+      },
       { status: 400 },
     );
   }

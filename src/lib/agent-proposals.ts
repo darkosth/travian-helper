@@ -2,6 +2,7 @@ import { db, ensureDatabase } from "@/lib/db";
 import { getActiveScopedAccount, getScopedAccount } from "@/lib/credentials";
 import { executeApprovedProposal } from "@/lib/playwright-capture";
 import { attachBuildMenuSlotsToSnapshot, parseDorf2BuildMenuPayload } from "@/lib/build-options";
+import { getPlannerStepSnapshotActionability } from "@/lib/planner/resolve-next-step";
 import {
   buildContextKey,
   buildLearningState,
@@ -430,22 +431,7 @@ export const generateAgentProposals = async (profileId?: string) => {
         ...candidate,
         rank: index,
       }));
-    const strictRouteCandidateId = heuristic.strictRoute?.candidateId ?? null;
-    const strictRouteScore = heuristic.strictRoute?.score ?? null;
-    const strictRouteReasons = heuristic.strictRoute?.reasons ?? [];
-    const prioritizedCandidates = (
-      strictRouteCandidateId
-        ? learningAwareCandidates.map((candidate) =>
-            candidate.id !== strictRouteCandidateId
-              ? candidate
-              : {
-                  ...candidate,
-                  score: Math.max(candidate.score, strictRouteScore ?? candidate.score),
-                  reasons: [...strictRouteReasons, ...candidate.reasons],
-                },
-          )
-        : learningAwareCandidates
-    )
+    const prioritizedCandidates = learningAwareCandidates
       .sort((left: LearningAwareCandidate, right: LearningAwareCandidate) => right.score - left.score)
       .map((candidate: LearningAwareCandidate, index: number) => ({
         ...candidate,
@@ -596,6 +582,75 @@ export const approveAgentProposal = async (
     });
 
     throw new Error("The village changed after this proposal was generated. Regenerate it first.");
+  }
+
+  let selectedFeatures:
+    | {
+        planner?: boolean;
+        planStepId?: string;
+        snapshotId?: string;
+        buildAction?: "upgrade" | "construct";
+        targetGid?: number | null;
+      }
+    | null = null;
+
+  try {
+    selectedFeatures =
+      selected.featuresJson.length > 0
+        ? (JSON.parse(selected.featuresJson) as {
+            planner?: boolean;
+            planStepId?: string;
+            snapshotId?: string;
+            buildAction?: "upgrade" | "construct";
+            targetGid?: number | null;
+          })
+        : null;
+  } catch {
+    selectedFeatures = null;
+  }
+
+  if (selectedFeatures?.planner) {
+    const plannerSnapshot = await db.villageSnapshot.findUnique({
+      where: {
+        id: selectedFeatures.snapshotId ?? proposal.villageSnapshotId,
+      },
+      include: {
+        resources: true,
+        resourceFields: true,
+        buildings: true,
+      },
+    });
+
+    if (!plannerSnapshot || plannerSnapshot.id !== proposal.villageSnapshotId) {
+      await db.agentProposal.update({
+        where: { id: proposal.id },
+        data: { status: "stale" },
+      });
+
+      throw new Error("The planner snapshot changed before execution. Regenerate it first.");
+    }
+
+    const plannerActionability = getPlannerStepSnapshotActionability(plannerSnapshot, {
+      id: selectedFeatures.planStepId ?? selected.id,
+      position: selected.rank,
+      stage: 1,
+      kind: selected.kind as "resourceField" | "building",
+      action: selectedFeatures.buildAction ?? "upgrade",
+      slot: selected.slot,
+      gid: selectedFeatures.targetGid ?? 0,
+      targetLevel: selected.level ?? 0,
+    });
+
+    if (!plannerActionability.isActionableNow) {
+      await db.agentProposal.update({
+        where: { id: proposal.id },
+        data: { status: "stale" },
+      });
+
+      throw new Error(
+        `Planner candidate is no longer actionable for the linked snapshot. ${plannerActionability.blockedReason ?? ""}`.trim(),
+      );
+    }
   }
 
   await db.agentProposal.update({
