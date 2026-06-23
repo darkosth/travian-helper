@@ -6,7 +6,7 @@ import { PlannerSandbox } from "@/app/planner/planner-sandbox";
 export default function PlannerPage() {
   return (
     <main className="min-h-screen bg-zinc-950 px-2 py-2 text-zinc-100 sm:px-4 sm:py-4">
-      <div className="mx-auto max-w-7xl space-y-6">
+      <div className="mx-auto w-full max-w-none space-y-6">
         <header className="space-y-3">
           <Link className="text-sm text-sky-400 hover:text-sky-300" href="/">
             ← Dashboard
