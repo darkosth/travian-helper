@@ -2,7 +2,7 @@
 
 import { useMemo, useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
-import { ChevronDown, Pencil, Plus, Server, User } from "lucide-react";
+import { ChevronDown, Pencil, Plus, Server, Trash2, User } from "lucide-react";
 import { CaptureButton } from "@/components/capture-button";
 import { SettingsForm } from "@/components/settings-form";
 import { Badge } from "@/components/ui/badge";
@@ -38,6 +38,7 @@ export function HomeHero({
   const [editingProfileId, setEditingProfileId] = useState<string | null>(null);
   const [activationFeedback, setActivationFeedback] = useState<string | null>(null);
   const [isActivating, startActivationTransition] = useTransition();
+  const [isDeleting, startDeleteTransition] = useTransition();
 
   const editingProfile =
     profiles.find((profile) => profile.id === editingProfileId) ?? null;
@@ -79,6 +80,48 @@ export function HomeHero({
       }
 
       setActivationFeedback("Active profile updated.");
+      router.refresh();
+    });
+  };
+
+  const deleteProfile = (profileId: string, username: string) => {
+    if (
+      !window.confirm(
+        `Delete profile ${username}? This will remove its linked account, villages, snapshots, runs, proposals, and queued jobs.`,
+      )
+    ) {
+      return;
+    }
+
+    setActivationFeedback(null);
+
+    startDeleteTransition(async () => {
+      const response = await fetch("/api/settings/credentials", {
+        method: "DELETE",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          profileId,
+        }),
+      });
+
+      const result = (await response.json()) as {
+        ok: boolean;
+        error?: string;
+      };
+
+      if (!response.ok || !result.ok) {
+        setActivationFeedback(result.error ?? "Could not delete this profile.");
+        return;
+      }
+
+      if (editingProfileId === profileId) {
+        setEditingProfileId(null);
+        setIsModalOpen(false);
+      }
+
+      setActivationFeedback("Profile deleted.");
       router.refresh();
     });
   };
@@ -235,12 +278,23 @@ export function HomeHero({
                         </Button>
                         <Button
                           className="min-h-11"
-                          disabled={isActive || isActivating}
+                          disabled={isActive || isActivating || isDeleting}
                           onClick={() => activateProfile(profile.id)}
                           size="lg"
                           type="button"
                         >
                           {isActive ? "En uso" : "Usar este perfil"}
+                        </Button>
+                        <Button
+                          className="min-h-11"
+                          disabled={isActive || isActivating || isDeleting}
+                          onClick={() => deleteProfile(profile.id, profile.username)}
+                          size="lg"
+                          type="button"
+                          variant="destructive"
+                        >
+                          <Trash2 />
+                          Borrar
                         </Button>
                       </div>
                     </div>

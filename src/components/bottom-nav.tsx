@@ -2,14 +2,12 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { Castle, House, Radar, Route } from "lucide-react";
+import { Castle, Route } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 const items = [
   { href: "/villages", label: "Villages", icon: Castle },
-  { href: "/", label: "Home", icon: House },
   { href: "/planner", label: "Planner", icon: Route },
-  { href: "/commands", label: "Commands", icon: Radar },
 ] as const;
 
 export function BottomNav() {
@@ -20,10 +18,7 @@ export function BottomNav() {
       <div className="flex w-full max-w-lg items-center justify-between rounded-[1.6rem] border border-white/10 bg-stone-950/90 px-2 py-2 shadow-2xl shadow-black/40 backdrop-blur xl:max-w-xl">
         {items.map((item) => {
           const Icon = item.icon;
-          const isActive =
-            item.href === "/"
-              ? pathname === "/"
-              : pathname === item.href || pathname.startsWith(`${item.href}/`);
+          const isActive = pathname === item.href || pathname.startsWith(`${item.href}/`);
 
           return (
             <Link
