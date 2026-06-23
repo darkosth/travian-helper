@@ -1271,10 +1271,7 @@ const findMilestoneCandidate = (
   }
 };
 
-const getExpansionMilestoneOverride = (
-  snapshot: VillageSnapshotLike,
-  account: AccountStrategyContext,
-): StrictRouteMilestone | null => {
+const getExpansionMilestoneOverride = (snapshot: VillageSnapshotLike): StrictRouteMilestone | null => {
   const townHallLevel = getBuildingLevel(snapshot, ["town hall", "ayuntamiento"]);
   const residenceLevel = getBuildingLevel(snapshot, ["residence", "residencia"]);
 
@@ -1307,7 +1304,7 @@ const getStrictRouteRecommendation = (input: {
   memory: MemoryProfile;
 }): StrictRouteContext | null => {
   const { snapshot, account, candidates, resources, memory } = input;
-  const override = getExpansionMilestoneOverride(snapshot, account);
+  const override = getExpansionMilestoneOverride(snapshot);
   const milestone =
     override ??
     secondVillageRoute.find((routeMilestone) => !isMilestoneComplete(routeMilestone, snapshot, account));
@@ -1385,23 +1382,8 @@ const applyStrictRoutePriority = (
   candidates: RecommendationCandidate[],
   strictRoute: StrictRouteContext | null,
 ) => {
-  if (!strictRoute?.candidateId) {
-    return candidates.slice().sort((left, right) => right.score - left.score);
-  }
-
-  return candidates
-    .map((candidate) => {
-      if (candidate.id !== strictRoute.candidateId) {
-        return candidate;
-      }
-
-      return {
-        ...candidate,
-        score: Math.max(candidate.score, strictRoute.score),
-        reasons: [...strictRoute.reasons, ...candidate.reasons],
-      };
-    })
-    .sort((left, right) => right.score - left.score);
+  void strictRoute;
+  return candidates.slice().sort((left, right) => right.score - left.score);
 };
 
 export const getVillageRecommendation = (input: {
@@ -1506,14 +1488,14 @@ export const buildVillageDecision = (input: {
     focus,
     recommendation: {
       priority,
-      title: strictRoute?.title ?? (selected.shouldWait
+      title: selected.shouldWait
         ? `Wait for ${selected.candidate.label}`
-        : selected.candidate.label),
-      summary: strictRoute?.summary ?? summary,
-      score: strictRoute?.score ?? selected.candidate.score,
-      shouldWait: strictRoute?.shouldWait ?? selected.shouldWait,
-      waitTimeText: strictRoute?.waitTimeText ?? waitTimeText,
-      reasons: strictRoute?.reasons ?? selected.candidate.reasons,
+        : selected.candidate.label,
+      summary,
+      score: selected.candidate.score,
+      shouldWait: selected.shouldWait,
+      waitTimeText,
+      reasons: selected.candidate.reasons,
       memorySummary: memory.summary,
       focus,
       strictRouteTitle: strictRoute?.title ?? null,

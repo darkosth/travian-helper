@@ -1,5 +1,5 @@
 import { generateAgentProposals } from "@/lib/agent-proposals";
-import { syncAutoApplyJobsFromLatestRun } from "@/lib/auto-apply";
+import { kickAutoApplyNow, syncAutoApplyJobsFromLatestRun } from "@/lib/auto-apply";
 import { db, ensureDatabase } from "@/lib/db";
 import { runManualCapture } from "@/lib/playwright-capture";
 
@@ -30,6 +30,7 @@ export const runCaptureAndGenerateProposals = async () => {
 
   const proposalIds = await generateAgentProposals();
   await syncAutoApplyJobsFromLatestRun();
+  await kickAutoApplyNow();
 
   return {
     runId,

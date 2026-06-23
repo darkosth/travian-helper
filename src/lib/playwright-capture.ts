@@ -1,5 +1,6 @@
 import { chromium, type Browser, type Page } from "playwright";
 import { db, ensureDatabase } from "@/lib/db";
+import { normalizeAutoApplyError } from "@/lib/auto-apply-errors";
 import {
   getCredentialSecret,
   getCredentialSecretForAccount,
@@ -549,7 +550,7 @@ export const runManualCapture = async (profileId?: string) => {
   const credentials = await getCredentialSecret(profileId);
 
   if (!credentials) {
-    throw new Error("Missing saved credentials.");
+    throw normalizeAutoApplyError(new Error("Missing saved credentials."));
   }
 
   const captureRun = await db.captureRun.create({
@@ -721,7 +722,8 @@ export const runManualCapture = async (profileId?: string) => {
 
     return captureRun.id;
   } catch (error) {
-    const message = error instanceof Error ? error.message : "Unknown capture failure";
+    const normalized = normalizeAutoApplyError(error, "AUTO_APPLY_CAPTURE_FAILED");
+    const message = normalized.message;
 
     await db.captureRun.update({
       where: {
@@ -734,7 +736,7 @@ export const runManualCapture = async (profileId?: string) => {
       },
     });
 
-    throw error;
+    throw normalized;
   } finally {
     await browser.close();
   }

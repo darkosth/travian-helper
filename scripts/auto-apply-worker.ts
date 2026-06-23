@@ -2,10 +2,13 @@ import "dotenv/config";
 
 import {
   getAutoApplyWorkerWaitMs,
+  maybeRefreshAutoApplyState,
   processDueAutoApplyJobs,
   refreshAutoApplyState,
 } from "../src/lib/auto-apply.ts";
+import { normalizeAutoApplyError } from "../src/lib/auto-apply-errors.ts";
 import { ensureDatabase } from "../src/lib/db.ts";
+import { removeProfilePm2Processes } from "../src/lib/profile-runtime.ts";
 
 const DEFAULT_WATCHDOG_MS = 8 * 60 * 1000;
 const WATCHDOG_MS = Number(process.env.AUTO_APPLY_CYCLE_TIMEOUT_MS ?? DEFAULT_WATCHDOG_MS);
@@ -26,6 +29,18 @@ const sleep = (ms: number) =>
 
 const formatDuration = (ms: number) => `${Math.round(ms / 1000)}s`;
 const logPrefix = `[auto-apply-worker:${PROFILE_ID}]`;
+
+const stopWorkerWithoutRestart = async (message: string) => {
+  console.error(`${logPrefix} ${message}`);
+
+  try {
+    await removeProfilePm2Processes(PROFILE_ID);
+  } catch (error) {
+    console.error(`${logPrefix} failed to deregister PM2 process`, error);
+  }
+
+  process.exit(0);
+};
 
 const runWithWatchdog = async <T>(
   label: string,
@@ -63,6 +78,28 @@ const refreshState = async (label: string) => {
   });
 };
 
+const handleRefreshFailure = async (label: string, error: unknown) => {
+  const normalized = normalizeAutoApplyError(error, "AUTO_APPLY_WORKER_REFRESH_FAILED");
+
+  if (normalized.kind === "terminal") {
+    await stopWorkerWithoutRestart(
+      `${label} stopped the worker permanently: ${normalized.message}`,
+    );
+    return;
+  }
+
+  if (normalized.kind === "connectivity") {
+    const retryAfterMs = normalized.retryAfterMs ?? 15 * 60 * 1000;
+    console.error(
+      `${logPrefix} ${label} hit connectivity cooldown for ${formatDuration(retryAfterMs)}: ${normalized.message}`,
+    );
+    await sleep(retryAfterMs);
+    return;
+  }
+
+  console.error(`${logPrefix} ${label} failed`, normalized);
+};
+
 const run = async () => {
   await ensureDatabase();
 
@@ -71,7 +108,11 @@ const run = async () => {
     await sleep(STARTUP_DELAY_MS);
   }
 
-  await refreshState("initial account refresh");
+  try {
+    await refreshState("initial account refresh");
+  } catch (error) {
+    await handleRefreshFailure("initial account refresh", error);
+  }
 
   while (true) {
     let processedJobs = 0;
@@ -90,7 +131,7 @@ const run = async () => {
       try {
         await refreshState("post-action account refresh");
       } catch (error) {
-        console.error(`${logPrefix} post-action refresh failed`, error);
+        await handleRefreshFailure("post-action account refresh", error);
       }
 
       continue;
@@ -108,17 +149,22 @@ const run = async () => {
     console.log(`${logPrefix} sleeping for ${formatDuration(safeWaitMs)}`);
     await sleep(safeWaitMs);
 
-    // Antes de intentar un job programado para el futuro, refrescamos el estado.
-    // Así evitamos actuar sobre recursos o colas antiguas.
     try {
-      await refreshState("scheduled account refresh");
+      await maybeRefreshAutoApplyState(PROFILE_ID);
     } catch (error) {
-      console.error(`${logPrefix} scheduled refresh failed`, error);
+      await handleRefreshFailure("scheduled account refresh", error);
     }
   }
 };
 
 run().catch((error) => {
-  console.error(`${logPrefix} fatal`, error);
+  const normalized = normalizeAutoApplyError(error, "AUTO_APPLY_WORKER_FATAL");
+
+  if (normalized.kind === "terminal") {
+    void stopWorkerWithoutRestart(`fatal terminal failure: ${normalized.message}`);
+    return;
+  }
+
+  console.error(`${logPrefix} fatal`, normalized);
   process.exit(1);
 });

@@ -5,20 +5,27 @@ import {
   getSoonestQueueDelayMs,
 } from "@/lib/construction-state";
 import { getActiveCredentialProfile, getCredentialProfile } from "@/lib/credentials";
+import { AutoApplyError, normalizeAutoApplyError } from "@/lib/auto-apply-errors";
 import { db, ensureDatabase } from "@/lib/db";
 import { runManualCapture } from "@/lib/playwright-capture";
+import { ensureProfilePm2Worker } from "@/lib/profile-runtime";
 import { syncPlannerAgentProposals } from "@/lib/planner/proposal-bridge";
 import type { ActiveConstructionLike } from "@/lib/recommendations";
 
 // El MVP prioriza un flujo fácil de observar:
 // una captura global, un solo job por ciclo y una sola acción por job.
 const SAFETY_SWEEP_MS = 5 * 60 * 1000;
+const NO_ACTIVE_VILLAGES_SLEEP_MS = 5 * 60 * 1000;
+const IDLE_REFRESH_INTERVAL_MS = 15 * 60 * 1000;
 const MIN_RETRY_DELAY_MS = 30 * 1000;
 const ERROR_RETRY_DELAY_MS = 60 * 1000;
 const QUEUE_FINISH_BUFFER_MS = 15 * 1000;
 const MAX_ATTEMPTS_BEFORE_PAUSE = 3;
 const ACTIVE_JOB_STATUSES = ["pending", "running"] as const;
 const STALE_RUNNING_JOB_MS = 2 * 60 * 1000;
+const CONNECTIVITY_COOLDOWN_STEPS_MS = [15 * 60 * 1000, 30 * 60 * 1000] as const;
+const MAX_CONNECTIVITY_COOLDOWN_MS =
+  CONNECTIVITY_COOLDOWN_STEPS_MS[CONNECTIVITY_COOLDOWN_STEPS_MS.length - 1];
 
 const resolveCredentialProfileId = async (profileId?: string) => {
   if (profileId) {
@@ -73,6 +80,14 @@ type AutoApplyCandidateLike = {
 const addMilliseconds = (date: Date, milliseconds: number) =>
   new Date(date.getTime() + milliseconds);
 
+const getConnectivityCooldownMs = (failureCount: number) =>
+  CONNECTIVITY_COOLDOWN_STEPS_MS[
+    Math.min(
+      Math.max(0, failureCount),
+      CONNECTIVITY_COOLDOWN_STEPS_MS.length - 1,
+    )
+  ] ?? MAX_CONNECTIVITY_COOLDOWN_MS;
+
 const shouldAllowSafeSecondSlot = (input: {
   activeConstructionSlots: number | null | undefined;
   candidate: AutoApplyCandidateLike | null;
@@ -96,7 +111,7 @@ const markJobsCancelledForVillage = async (
       villageId,
       ...(profileId ? { credentialProfileId: profileId } : {}),
       status: {
-        in: [...ACTIVE_JOB_STATUSES],
+        in: ["pending", "running", "paused"],
       },
     },
     data: {
@@ -108,6 +123,61 @@ const markJobsCancelledForVillage = async (
     },
   });
 };
+
+const getProfileWorkerState = async (profileId: string) => {
+  const profile = await db.credentialProfile.findUnique({
+    where: { id: profileId },
+    select: {
+      id: true,
+      autoApplyConnectivityFailureCount: true,
+      autoApplyCooldownReason: true,
+      autoApplyCooldownUntil: true,
+      lastAutoApplyRefreshAt: true,
+    },
+  });
+
+  if (!profile) {
+    throw new AutoApplyError({
+      code: "AUTO_APPLY_PROFILE_MISSING",
+      kind: "terminal",
+      message: "Credential profile not found.",
+    });
+  }
+
+  return profile;
+};
+
+const markRefreshSuccess = async (profileId: string) => {
+  await db.credentialProfile.update({
+    where: { id: profileId },
+    data: {
+      autoApplyConnectivityFailureCount: 0,
+      autoApplyCooldownReason: null,
+      autoApplyCooldownUntil: null,
+      lastAutoApplyRefreshAt: new Date(),
+    },
+  });
+};
+
+const markConnectivityCooldown = async (profileId: string, message: string) => {
+  const profile = await getProfileWorkerState(profileId);
+  const nextFailureCount = (profile.autoApplyConnectivityFailureCount ?? 0) + 1;
+  const cooldownMs = getConnectivityCooldownMs(nextFailureCount - 1);
+
+  await db.credentialProfile.update({
+    where: { id: profileId },
+    data: {
+      autoApplyConnectivityFailureCount: nextFailureCount,
+      autoApplyCooldownReason: message,
+      autoApplyCooldownUntil: addMilliseconds(new Date(), cooldownMs),
+    },
+  });
+
+  return cooldownMs;
+};
+
+const isCooldownActive = (cooldownUntil: Date | null | undefined) =>
+  Boolean(cooldownUntil && cooldownUntil.getTime() > Date.now());
 
 export const pauseVillageAutoApply = async (input: {
   villageId: string;
@@ -453,13 +523,32 @@ export const refreshAutoApplyState = async (profileId?: string) => {
   await ensureDatabase();
   const resolvedProfileId = await resolveCredentialProfileId(profileId);
   await recoverStaleRunningJobs(resolvedProfileId);
+  await getProfileWorkerState(resolvedProfileId);
 
-  const captureRunId = await runManualCapture(resolvedProfileId);
-  await generateAgentProposals(resolvedProfileId);
-  await syncPlannerAgentProposals(resolvedProfileId);
-  await syncAutoApplyJobsFromLatestRun(resolvedProfileId);
+  try {
+    const captureRunId = await runManualCapture(resolvedProfileId);
+    await generateAgentProposals(resolvedProfileId);
+    await syncPlannerAgentProposals(resolvedProfileId);
+    await syncAutoApplyJobsFromLatestRun(resolvedProfileId);
+    await markRefreshSuccess(resolvedProfileId);
 
-  return captureRunId;
+    return captureRunId;
+  } catch (error) {
+    const normalized = normalizeAutoApplyError(error, "AUTO_APPLY_REFRESH_FAILED");
+
+    if (normalized.kind === "connectivity") {
+      const cooldownMs = await markConnectivityCooldown(resolvedProfileId, normalized.message);
+      throw new AutoApplyError({
+        cause: normalized,
+        code: normalized.code,
+        kind: normalized.kind,
+        message: normalized.message,
+        retryAfterMs: cooldownMs,
+      });
+    }
+
+    throw normalized;
+  }
 };
 
 export const setVillageAutoApply = async (input: {
@@ -502,7 +591,23 @@ export const setVillageAutoApply = async (input: {
   }
 
   await clearVillagePause(input.villageId);
-  await syncAutoApplyJobsFromLatestRun(resolvedProfileId);
+  await markJobsCancelledForVillage(
+    input.villageId,
+    "Auto-apply re-enabled. Rebuilding queue from a fresh capture.",
+    resolvedProfileId,
+  );
+  const profile = await getCredentialProfile(resolvedProfileId);
+
+  if (!profile) {
+    throw new Error("Credential profile not found.");
+  }
+
+  await ensureProfilePm2Worker({
+    profileId: profile.id,
+    label: profile.label,
+  });
+  await refreshAutoApplyState(resolvedProfileId);
+  await kickAutoApplyNow(resolvedProfileId);
 };
 
 const getNextPendingJob = async (profileId: string) =>
@@ -518,6 +623,59 @@ const getNextPendingJob = async (profileId: string) =>
       village: true,
     },
   });
+
+const hasEnabledVillagesForProfile = async (profileId: string) => {
+  const profile = await getCredentialProfile(profileId);
+
+  if (!profile?.accountId) {
+    return false;
+  }
+
+  const enabledVillages = await db.village.count({
+    where: {
+      accountId: profile.accountId,
+      autoApplyEnabled: true,
+    },
+  });
+
+  return enabledVillages > 0;
+};
+
+const shouldRunIdleRefresh = async (profileId: string) => {
+  const profile = await getProfileWorkerState(profileId);
+
+  if (isCooldownActive(profile.autoApplyCooldownUntil)) {
+    return false;
+  }
+
+  if (!(await hasEnabledVillagesForProfile(profileId))) {
+    return false;
+  }
+
+  const nextJob = await getNextPendingJob(profileId);
+
+  if (nextJob) {
+    return nextJob.runAt.getTime() <= Date.now();
+  }
+
+  if (!profile.lastAutoApplyRefreshAt) {
+    return true;
+  }
+
+  return profile.lastAutoApplyRefreshAt.getTime() + IDLE_REFRESH_INTERVAL_MS <= Date.now();
+};
+
+export const maybeRefreshAutoApplyState = async (profileId?: string) => {
+  await ensureDatabase();
+  const resolvedProfileId = await resolveCredentialProfileId(profileId);
+
+  if (!(await shouldRunIdleRefresh(resolvedProfileId))) {
+    return false;
+  }
+
+  await refreshAutoApplyState(resolvedProfileId);
+  return true;
+};
 
 const claimJob = async (jobId: string, profileId: string) => {
   const lockToken = randomUUID();
@@ -556,14 +714,6 @@ const finishJob = async (jobId: string, status: string, lastError?: string | nul
     },
   });
 };
-
-const isDeterministicFailure = (message: string) =>
-  /captcha|login|anti-bot|no confirmó el inicio de la construcción|Building slot \d+ was not found|Resource field slot \d+ was not found|No se encontró un botón directo para construir/i.test(
-    message,
-  );
-
-const isStaleProposalFailure = (message: string) =>
-  /The village changed after this proposal was generated|Regenerate it first/i.test(message);
 
 export const processAutoApplyJob = async (jobId: string, profileId?: string) => {
   await ensureDatabase();
@@ -666,14 +816,15 @@ export const processAutoApplyJob = async (jobId: string, profileId?: string) => 
 
     return true;
   } catch (error) {
-    const message = error instanceof Error ? error.message : "Unknown auto-apply failure.";
+    const normalized = normalizeAutoApplyError(error, "AUTO_APPLY_JOB_FAILED");
+    const message = normalized.message;
 
-    if (isStaleProposalFailure(message)) {
+    if (normalized.kind === "stale") {
       await finishJob(job.id, "done", "Proposal became stale. Refresh required.");
       return true;
     }
 
-    if (isDeterministicFailure(message)) {
+    if (normalized.kind === "deterministic") {
       await pauseVillageAutoApply({
         villageId: job.villageId,
         reason: message,
@@ -728,10 +879,28 @@ export const getAutoApplyWorkerWaitMs = async (profileId?: string) => {
   await ensureDatabase();
   const resolvedProfileId = await resolveCredentialProfileId(profileId);
   await recoverStaleRunningJobs(resolvedProfileId);
+  const workerState = await getProfileWorkerState(resolvedProfileId);
+  const cooldownUntil = workerState.autoApplyCooldownUntil;
+
+  if (isCooldownActive(cooldownUntil)) {
+    return Math.max(0, cooldownUntil!.getTime() - Date.now());
+  }
+
+  if (!(await hasEnabledVillagesForProfile(resolvedProfileId))) {
+    return NO_ACTIVE_VILLAGES_SLEEP_MS;
+  }
+
   const nextJob = await getNextPendingJob(resolvedProfileId);
 
   if (!nextJob) {
-    return SAFETY_SWEEP_MS;
+    if (!workerState.lastAutoApplyRefreshAt) {
+      return 0;
+    }
+
+    return Math.max(
+      MIN_RETRY_DELAY_MS,
+      workerState.lastAutoApplyRefreshAt.getTime() + IDLE_REFRESH_INTERVAL_MS - Date.now(),
+    );
   }
 
   return Math.max(0, Math.min(nextJob.runAt.getTime() - Date.now(), SAFETY_SWEEP_MS));
@@ -805,4 +974,14 @@ export const processDueAutoApplyJobs = async (profileId?: string) => {
 
   await processAutoApplyJob(dueJob.id, resolvedProfileId);
   return 1;
+};
+
+export const kickAutoApplyNow = async (profileId?: string) => {
+  const processedJobs = await processDueAutoApplyJobs(profileId);
+
+  if (processedJobs > 0) {
+    await refreshAutoApplyState(profileId);
+  }
+
+  return processedJobs;
 };
