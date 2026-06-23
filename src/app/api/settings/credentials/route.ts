@@ -1,9 +1,11 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
 import {
+  deleteCredentialProfile,
   activateCredentialProfile,
   getCredentialSummary,
   saveCredentialProfile,
+  sanitizeCredentialProfileRuntime,
 } from "@/lib/credentials";
 
 const credentialsSchema = z
@@ -27,7 +29,12 @@ const activateSchema = z.object({
   profileId: z.string().min(1),
 });
 
+const deleteSchema = z.object({
+  profileId: z.string().min(1),
+});
+
 export async function GET() {
+  await sanitizeCredentialProfileRuntime();
   const summary = await getCredentialSummary();
 
   return NextResponse.json({
@@ -81,6 +88,37 @@ export async function PATCH(request: Request) {
 
     return NextResponse.json({
       ok: true,
+    });
+  } catch (error) {
+    if (error instanceof z.ZodError) {
+      return NextResponse.json(
+        {
+          ok: false,
+          errors: error.issues,
+        },
+        { status: 400 },
+      );
+    }
+
+    return NextResponse.json(
+      {
+        ok: false,
+        error: error instanceof Error ? error.message : "Unknown error",
+      },
+      { status: 500 },
+    );
+  }
+}
+
+export async function DELETE(request: Request) {
+  try {
+    const payload = deleteSchema.parse(await request.json());
+    const result = await deleteCredentialProfile(payload.profileId);
+
+    return NextResponse.json({
+      ok: true,
+      deletedProfileId: result.deletedProfileId,
+      nextActiveProfileId: result.nextActiveProfileId,
     });
   } catch (error) {
     if (error instanceof z.ZodError) {

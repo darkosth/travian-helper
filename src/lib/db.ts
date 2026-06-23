@@ -32,6 +32,10 @@ const bootstrapStatements = [
     "authTag" TEXT NOT NULL,
     "isActive" BOOLEAN NOT NULL DEFAULT false,
     "accountId" TEXT,
+    "autoApplyCooldownUntil" DATETIME,
+    "autoApplyCooldownReason" TEXT,
+    "autoApplyConnectivityFailureCount" INTEGER NOT NULL DEFAULT 0,
+    "lastAutoApplyRefreshAt" DATETIME,
     "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "updatedAt" DATETIME NOT NULL,
     FOREIGN KEY ("accountId") REFERENCES "Account"("id") ON DELETE SET NULL ON UPDATE CASCADE
@@ -354,6 +358,30 @@ export const ensureDatabase = async () => {
         );
       }
 
+      if (!(await tableHasColumn("CredentialProfile", "autoApplyCooldownUntil"))) {
+        await db.$executeRawUnsafe(
+          `ALTER TABLE "CredentialProfile" ADD COLUMN "autoApplyCooldownUntil" DATETIME;`,
+        );
+      }
+
+      if (!(await tableHasColumn("CredentialProfile", "autoApplyCooldownReason"))) {
+        await db.$executeRawUnsafe(
+          `ALTER TABLE "CredentialProfile" ADD COLUMN "autoApplyCooldownReason" TEXT;`,
+        );
+      }
+
+      if (!(await tableHasColumn("CredentialProfile", "autoApplyConnectivityFailureCount"))) {
+        await db.$executeRawUnsafe(
+          `ALTER TABLE "CredentialProfile" ADD COLUMN "autoApplyConnectivityFailureCount" INTEGER NOT NULL DEFAULT 0;`,
+        );
+      }
+
+      if (!(await tableHasColumn("CredentialProfile", "lastAutoApplyRefreshAt"))) {
+        await db.$executeRawUnsafe(
+          `ALTER TABLE "CredentialProfile" ADD COLUMN "lastAutoApplyRefreshAt" DATETIME;`,
+        );
+      }
+
       if (!(await tableHasColumn("CaptureRun", "credentialProfileId"))) {
         await db.$executeRawUnsafe(
           `ALTER TABLE "CaptureRun" ADD COLUMN "credentialProfileId" TEXT;`,
@@ -393,6 +421,18 @@ export const ensureDatabase = async () => {
       if (!(await tableHasColumn("Village", "autoApplyPauseReason"))) {
         await db.$executeRawUnsafe(
           `ALTER TABLE "Village" ADD COLUMN "autoApplyPauseReason" TEXT;`,
+        );
+      }
+
+      if (!(await tableHasColumn("Village", "plannerMode"))) {
+        await db.$executeRawUnsafe(
+          `ALTER TABLE "Village" ADD COLUMN "plannerMode" TEXT NOT NULL DEFAULT 'off';`,
+        );
+      }
+
+      if (!(await tableHasColumn("AutoApplyJob", "planStepId"))) {
+        await db.$executeRawUnsafe(
+          `ALTER TABLE "AutoApplyJob" ADD COLUMN "planStepId" TEXT;`,
         );
       }
 

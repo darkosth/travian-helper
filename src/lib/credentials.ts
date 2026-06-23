@@ -1,6 +1,11 @@
 import { db, ensureDatabase } from "@/lib/db";
 import { decryptSecret, encryptSecret } from "@/lib/crypto";
 import { clearSavedSessionState } from "@/lib/playwright-session";
+import {
+  ensureProfilePm2Worker,
+  removeOrphanedProfilePm2Processes,
+  removeProfilePm2Processes,
+} from "@/lib/profile-runtime";
 
 type SaveCredentialProfileInput = {
   password?: string;
@@ -101,6 +106,18 @@ export const getCredentialSummary = async () => {
     profiles,
     activeProfileId: activeProfile?.id ?? null,
   };
+};
+
+export const sanitizeCredentialProfileRuntime = async () => {
+  await ensureDatabase();
+
+  const profileIds = (
+    await db.credentialProfile.findMany({
+      select: { id: true },
+    })
+  ).map((profile) => profile.id);
+
+  return removeOrphanedProfilePm2Processes(profileIds);
 };
 
 export const getScopedAccount = async (profileId: string) => {
@@ -343,6 +360,8 @@ export const saveCredentialProfile = async (input: SaveCredentialProfileInput) =
       });
     }
 
+    await sanitizeCredentialProfileRuntime();
+
     return updatedProfile;
   }
 
@@ -370,6 +389,11 @@ export const saveCredentialProfile = async (input: SaveCredentialProfileInput) =
   });
 
   await clearSavedSessionState(createdProfile.id);
+  await sanitizeCredentialProfileRuntime();
+  await ensureProfilePm2Worker({
+    profileId: createdProfile.id,
+    label: createdProfile.label,
+  });
 
   return createdProfile;
 };
@@ -408,4 +432,88 @@ export const activateCredentialProfile = async (profileId: string) => {
 
   // Cambiar qué perfil se ve en la interfaz no debe cerrar la sesión
   // Playwright de otros workers. Cada perfil usa su propio storageState.
+  await sanitizeCredentialProfileRuntime();
+  await ensureProfilePm2Worker({
+    profileId: existingProfile.id,
+    label: existingProfile.label,
+  });
+};
+
+export const deleteCredentialProfile = async (profileId: string) => {
+  await ensureDatabase();
+
+  const existingProfile = await db.credentialProfile.findUnique({
+    where: {
+      id: profileId,
+    },
+  });
+
+  if (!existingProfile) {
+    throw new Error("Credential profile not found.");
+  }
+
+  const fallbackProfile = await db.credentialProfile.findFirst({
+    where: {
+      id: {
+        not: profileId,
+      },
+    },
+    orderBy: [
+      {
+        updatedAt: "desc",
+      },
+      {
+        createdAt: "desc",
+      },
+    ],
+  });
+
+  await removeProfilePm2Processes(existingProfile.id);
+
+  await db.$transaction(async (tx) => {
+    await tx.autoApplyJob.deleteMany({
+      where: {
+        credentialProfileId: existingProfile.id,
+      },
+    });
+
+    await tx.captureRun.deleteMany({
+      where: {
+        credentialProfileId: existingProfile.id,
+      },
+    });
+
+    if (existingProfile.accountId) {
+      await tx.account.delete({
+        where: {
+          id: existingProfile.accountId,
+        },
+      });
+    }
+
+    await tx.credentialProfile.delete({
+      where: {
+        id: existingProfile.id,
+      },
+    });
+
+    if (existingProfile.isActive && fallbackProfile) {
+      await tx.credentialProfile.update({
+        where: {
+          id: fallbackProfile.id,
+        },
+        data: {
+          isActive: true,
+        },
+      });
+    }
+  });
+
+  await clearSavedSessionState(existingProfile.id);
+  await sanitizeCredentialProfileRuntime();
+
+  return {
+    deletedProfileId: existingProfile.id,
+    nextActiveProfileId: existingProfile.isActive ? fallbackProfile?.id ?? null : null,
+  };
 };

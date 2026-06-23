@@ -22,6 +22,10 @@ model CredentialProfile {
   authTag           String
   isActive          Boolean  @default(false)
   accountId         String?
+  autoApplyCooldownUntil DateTime?
+  autoApplyCooldownReason String?
+  autoApplyConnectivityFailureCount Int @default(0)
+  lastAutoApplyRefreshAt DateTime?
   createdAt         DateTime @default(now())
   updatedAt         DateTime @updatedAt
   account           Account? @relation(fields: [accountId], references: [id], onDelete: SetNull)
@@ -426,4 +430,12 @@ model VillagePlanStep {
 
   @@unique([planId, position])
   @@index([planId, status, position])
+}
+
+model PlannerInitialStateProfile {
+  id          String   @id @default(cuid())
+  serverSpeed Int      @unique
+  stateJson   String
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
 }
