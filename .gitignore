@@ -60,3 +60,5 @@ backups/
 
 # Respaldos locales
 *.db.backup*
+.yuri-browser-testing/
+travian-helper-planner-resource-field-selector-fix.zip
